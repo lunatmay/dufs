@@ -2,7 +2,7 @@
 
 [![Docker](https://github.com/lunatmay/dufs/actions/workflows/docker.yaml/badge.svg)](https://github.com/lunatmay/dufs/actions/workflows/docker.yaml)
 
-Dufs is a distinctive utility file server that supports static serving, uploading, searching, accessing control, webdav...
+Dufs is a standalone utility file server that supports static serving, uploading, searching, access control, and WebDAV. This project is based on [upstream Dufs](https://github.com/sigoden/dufs).
 
 ![demo](https://user-images.githubusercontent.com/4012553/220513063-ff0f186b-ac54-4682-9af4-47a9781dee0d.png)
 
@@ -20,7 +20,7 @@ Dufs is a distinctive utility file server that supports static serving, uploadin
 
 ## WebDAV protocol support
 
-This fork implements a filesystem-backed, non-locking WebDAV server. It follows the standard HTTP and WebDAV interfaces rather than requiring a fork-specific client.
+Dufs implements a filesystem-backed, non-locking WebDAV server. It follows standard HTTP and WebDAV interfaces rather than requiring a specialized client.
 
 ### Compliance classes
 
@@ -61,14 +61,7 @@ Other WebDAV extensions are not currently implemented, including DeltaV versioni
 
 ## Install
 
-This fork publishes Linux amd64 Docker images to GitHub Container Registry on version tags.
-The cargo, Homebrew and binary installations below refer to the original upstream version, not the JoyPlay save-sync fork.
-
-### With cargo
-
-```
-cargo install dufs
-```
+This project publishes Linux amd64 Docker images to GitHub Container Registry on version tags. Standalone binary packages are not published.
 
 ### With docker
 
@@ -76,15 +69,11 @@ cargo install dufs
 docker run -v `pwd`:/data -p 5000:5000 --rm ghcr.io/lunatmay/dufs:latest /data -A
 ```
 
-### With [Homebrew](https://brew.sh)
+### From source
 
+```sh
+cargo install --locked --git https://github.com/lunatmay/dufs.git
 ```
-brew install dufs
-```
-
-### Binaries on macOS, Linux, Windows
-
-Download from [Github Releases](https://github.com/sigoden/dufs/releases), unzip and add dufs to your $PATH.
 
 ## CLI
 
