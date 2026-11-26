@@ -61,18 +61,12 @@ Other WebDAV extensions are not currently implemented, including DeltaV versioni
 
 ## Install
 
-This project publishes Linux amd64 Docker images to GitHub Container Registry on version tags. Standalone binary packages are not published.
+This project publishes Linux amd64 Docker images to GitHub Container Registry on version tags.
 
 ### With docker
 
 ```
 docker run -v `pwd`:/data -p 5000:5000 --rm ghcr.io/lunatmay/dufs:latest /data -A
-```
-
-### From source
-
-```sh
-cargo install --locked --git https://github.com/lunatmay/dufs.git
 ```
 
 ## CLI
