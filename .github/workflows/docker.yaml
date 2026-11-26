@@ -25,7 +25,7 @@ jobs:
           tags: type=semver,pattern={{raw}}
       - uses: docker/build-push-action@v7
         with:
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
