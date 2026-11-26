@@ -600,7 +600,10 @@ fn dav_capabilities(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     let resp = fetch!(b"OPTIONS", &url).send()?;
     assert_eq!(resp.headers().get("DAV").unwrap(), "1, 3");
     let missing = fetch!(b"OPTIONS", format!("{}missing", server.url())).send()?;
-    assert!(missing.headers().get("DAV").is_none());
+    assert_eq!(
+        missing.headers().get("DAV").unwrap(),
+        "1, 3, extended-mkcol"
+    );
     let allow: Vec<_> = resp
         .headers()
         .get("Allow")

@@ -1,8 +1,14 @@
 #![allow(clippy::too_many_arguments)]
 
+mod dav_common;
+mod dav_search;
+mod dav_sync;
+mod http_digest;
+use dav_common::DavPrefer;
+
 use crate::auth::{www_authenticate, AccessControl, AccessPaths, AccessPerm, EntryAccess};
 use crate::error::DufsErrorCode;
-use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
+use crate::http_utils::{body_full, LengthLimitedStream};
 use crate::noscript::{detect_noscript, generate_noscript_html};
 use crate::utils::{
     decode_uri, encode_uri, get_file_name, glob, join_within, parse_range, try_get_file_name,
@@ -13,7 +19,7 @@ use anyhow::{anyhow, Result};
 use async_deflate_zip::{CompressionLevel, EntryOptions, ZipWriter};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
-use futures_util::{pin_mut, TryStreamExt};
+use futures_util::TryStreamExt;
 use headers::{
     AcceptRanges, AccessControlAllowOrigin, CacheControl, ContentLength, ContentType, ETag,
     HeaderMap, HeaderMapExt, IfMatch, IfModifiedSince, IfNoneMatch, IfRange, IfUnmodifiedSince,
@@ -45,7 +51,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tokio::{fs, io};
 
-use tokio_util::io::{ReaderStream, StreamReader};
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 use xml::escape::{escape_str_attribute, escape_str_pcdata};
@@ -73,6 +79,7 @@ pub struct Server {
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
     write_locks: Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>,
+    sync_history: dav_sync::SyncHistory,
 }
 
 impl Server {
@@ -105,6 +112,7 @@ impl Server {
             assets_prefix,
             html,
             write_locks: Mutex::default(),
+            sync_history: dav_sync::SyncHistory::default(),
         })
     }
 
@@ -141,7 +149,18 @@ impl Server {
             }
             Err(err) => {
                 let mut res = Response::default();
-                let status = StatusCode::INTERNAL_SERVER_ERROR;
+                let status = if let Some(precondition) = dav_common::storage_precondition(&err) {
+                    res.headers_mut().insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("application/xml; charset=utf-8"),
+                    );
+                    *res.body_mut() = body_full(format!(
+                        "<D:error xmlns:D=\"DAV:\"><D:{precondition}/></D:error>"
+                    ));
+                    StatusCode::INSUFFICIENT_STORAGE
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
                 *res.status_mut() = status;
                 http_log_data.insert("status".to_string(), status.as_u16().to_string());
                 self.args
@@ -212,7 +231,7 @@ impl Server {
         };
 
         // Hold source, destination, and tagged condition paths through filesystem changes.
-        let _write_guards = if is_write_method(&method) {
+        let _write_guards = if is_write_method(&method) || method.as_str() == "REPORT" {
             let mut paths = vec![];
             if matches!(method.as_str(), "MOVE" | "COPY") {
                 paths.extend(
@@ -398,10 +417,11 @@ impl Server {
             None
         };
 
+        let prefer = DavPrefer::parse(headers);
         if !dav_if.is_empty() {
             let mut matched = false;
             for group in dav_if {
-                let etag = if let Some(resource) = &group.resource {
+                let (etag, token) = if let Some(resource) = &group.resource {
                     let relative =
                         match dav_uri_path(resource, headers).and_then(|v| self.resolve_path(&v)) {
                             Some(relative) => relative,
@@ -437,21 +457,58 @@ impl Server {
                         return Ok(res);
                     }
                     let target_meta = fs::metadata(&target).await.ok();
-                    self.dav_validators(&target, target_meta.as_ref(), user.clone(), target_access)
+                    let token =
+                        if group.needs_sync() && target_meta.as_ref().is_some_and(|m| m.is_dir()) {
+                            self.sync_collection_token(
+                                &target,
+                                user.clone(),
+                                target_access.clone().unwrap(),
+                                via_token,
+                            )
+                            .await
+                            .ok()
+                        } else {
+                            None
+                        };
+                    let etag = self
+                        .dav_validators(&target, target_meta.as_ref(), user.clone(), target_access)
                         .await?
-                        .map(|(etag, _)| etag)
+                        .map(|(etag, _)| etag);
+                    (etag, token)
                 } else {
-                    validators.as_ref().map(|(etag, _)| etag.clone())
+                    let token = if group.needs_sync() && is_dir {
+                        self.sync_collection_token(
+                            path,
+                            user.clone(),
+                            access_paths.clone(),
+                            via_token,
+                        )
+                        .await
+                        .ok()
+                    } else {
+                        None
+                    };
+                    (validators.as_ref().map(|(etag, _)| etag.clone()), token)
                 };
-                matched |= group.matches(etag.as_ref());
+                matched |= group.matches(etag.as_ref(), token.as_deref());
             }
             if !matched {
                 DufsErrorCode::PreconditionFailed.respond(&mut res);
+                if prefer.representation
+                    && !via_token
+                    && matches!(method.as_str(), "PUT" | "PATCH" | "COPY" | "MOVE")
+                {
+                    let _ = self
+                        .preferred_representation(path, user.clone(), prefer, &mut res)
+                        .await;
+                }
                 return Ok(res);
             }
         }
 
-        match method {
+        let response_user = user.clone();
+        let response_destination = destination.clone();
+        match method.clone() {
             Method::GET | Method::HEAD => {
                 if is_dir {
                     if !render_try_index
@@ -605,6 +662,7 @@ impl Server {
                     is_file,
                     is_dir,
                     is_miss,
+                    allow_search,
                 );
             }
             Method::PUT => {
@@ -720,6 +778,69 @@ impl Server {
                 }
             }
             method => match method.as_str() {
+                "REPORT" => {
+                    if is_miss {
+                        status_not_found(&mut res);
+                    } else if check_preconditions(
+                        headers,
+                        validators.as_ref(),
+                        meta.is_some(),
+                        false,
+                        &mut res,
+                    ) {
+                        let (parts, body) = req.into_parts();
+                        match Limited::new(body, 65536).collect().await {
+                            Ok(body) => {
+                                self.handle_sync_report(
+                                    path,
+                                    &parts.headers,
+                                    &body.to_bytes(),
+                                    user,
+                                    access_paths,
+                                    via_token,
+                                    &mut res,
+                                )
+                                .await?;
+                                if res.status() == StatusCode::MULTI_STATUS {
+                                    prefer.applied(&mut res, true, false, false);
+                                }
+                            }
+                            Err(_) => *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE,
+                        }
+                    }
+                }
+                "SEARCH" if allow_search && is_dir => {
+                    if !check_preconditions(
+                        headers,
+                        validators.as_ref(),
+                        meta.is_some(),
+                        false,
+                        &mut res,
+                    ) {
+                        return Ok(res);
+                    }
+                    let req_path = req_path.to_owned();
+                    let (parts, body) = req.into_parts();
+                    match Limited::new(body, 65536).collect().await {
+                        Ok(body) => {
+                            self.handle_dav_search(
+                                path,
+                                &req_path,
+                                &parts.headers,
+                                &body.to_bytes(),
+                                user,
+                                access_paths,
+                                via_token,
+                                &mut res,
+                            )
+                            .await?;
+                            if res.status() == StatusCode::MULTI_STATUS {
+                                prefer.applied(&mut res, true, false, false);
+                            }
+                        }
+                        Err(_) => *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE,
+                    }
+                }
                 "PROPFIND" => {
                     let anonymous = authorization.is_none();
                     let (parts, body) = req.into_parts();
@@ -745,6 +866,15 @@ impl Server {
                             return Ok(res);
                         }
                     };
+                    // Ordinary directory reads see the last complete file during an upload.
+                    let _sync_guard = if is_dir
+                        && !matches!(selection, DavSelection::Names)
+                        && selection.extension("sync-token")
+                    {
+                        Some(self.lock_write_paths(path, &[]).await)
+                    } else {
+                        None
+                    };
                     if is_dir {
                         if !check_preconditions(
                             headers,
@@ -762,6 +892,7 @@ impl Server {
                             access_paths,
                             anonymous,
                             &selection,
+                            via_token,
                             &mut res,
                         )
                         .await?;
@@ -775,10 +906,18 @@ impl Server {
                         ) {
                             return Ok(res);
                         }
-                        self.handle_propfind_file(path, &selection, &mut res)
+                        self.handle_propfind_file(path, &selection, headers, &mut res)
                             .await?;
                     } else {
                         status_not_found(&mut res);
+                    }
+                    if res.status() == StatusCode::MULTI_STATUS {
+                        prefer.applied(
+                            &mut res,
+                            true,
+                            is_dir && headers.get("Depth").is_some_and(|v| v.as_bytes() == b"1"),
+                            false,
+                        );
                     }
                 }
                 "PROPPATCH" => {
@@ -807,6 +946,7 @@ impl Server {
                                 user.clone(),
                                 access_paths,
                                 &body,
+                                prefer,
                                 &mut res,
                             )
                             .await?;
@@ -826,6 +966,7 @@ impl Server {
                             is_file,
                             is_dir,
                             is_miss,
+                            allow_search,
                         );
                         DufsErrorCode::AlreadyExists.respond(&mut res);
                     } else if !has_directory_parent(path).await {
@@ -839,7 +980,19 @@ impl Server {
                                 return Ok(res);
                             }
                         };
-                        if !body.is_empty() {
+                        let extended = !body.is_empty();
+                        if extended
+                            && !parts
+                                .headers
+                                .get(CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|v| {
+                                    matches!(
+                                        v.split(';').next().unwrap_or("").trim(),
+                                        "application/xml" | "text/xml"
+                                    )
+                                })
+                        {
                             *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
                         } else if check_preconditions(
                             &parts.headers,
@@ -847,8 +1000,12 @@ impl Server {
                             meta.is_some(),
                             false,
                             &mut res,
-                        ) {
+                        ) && (!extended || dav_common::extended_mkcol(&body, &mut res))
+                        {
                             self.handle_mkcol(path, &mut res).await?;
+                            if extended && res.status() == StatusCode::CREATED {
+                                prefer.applied(&mut res, true, false, false);
+                            }
                         }
                     }
                 }
@@ -903,12 +1060,105 @@ impl Server {
                         is_file,
                         is_dir,
                         is_miss,
+                        allow_search,
                     );
                     DufsErrorCode::MethodNotAllowed.respond(&mut res);
                 }
             },
         }
+        if is_write_method(&method) && res.status().is_success() {
+            self.sync_observe_tracked(path, response_destination.as_deref())
+                .await;
+        }
+        if prefer.representation
+            && !via_token
+            && matches!(method.as_str(), "PUT" | "PATCH" | "COPY" | "MOVE")
+            && matches!(
+                res.status(),
+                StatusCode::OK
+                    | StatusCode::CREATED
+                    | StatusCode::NO_CONTENT
+                    | StatusCode::PRECONDITION_FAILED
+            )
+        {
+            let target = if res.status() == StatusCode::PRECONDITION_FAILED {
+                path
+            } else {
+                response_destination.as_deref().unwrap_or(path)
+            };
+            // A response preference must not turn an already committed write into an error.
+            let _ = self
+                .preferred_representation(target, response_user, prefer, &mut res)
+                .await;
+        }
         Ok(res)
+    }
+
+    async fn preferred_representation(
+        &self,
+        path: &Path,
+        user: Option<String>,
+        prefer: DavPrefer,
+        res: &mut Response,
+    ) -> Result<()> {
+        let Ok(relative) = path.strip_prefix(&self.args.serve_path) else {
+            return Ok(());
+        };
+        let Some(access) = self
+            .args
+            .auth
+            .access_for(
+                user.as_deref(),
+                &normalize_path(relative),
+                &Method::GET,
+                &self.args.serve_path,
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        if self.guard_root_contained(path).await {
+            return Ok(());
+        }
+        let Ok(meta) = fs::metadata(path).await else {
+            return Ok(());
+        };
+        let mut representation = Response::default();
+        if meta.is_file() {
+            self.handle_send_file(path, &HeaderMap::new(), false, &mut representation)
+                .await?;
+        } else if meta.is_dir() {
+            representation = self
+                .dav_representation(path, true, user, Some(access))
+                .await?;
+        } else {
+            return Ok(());
+        }
+        if !representation.status().is_success() {
+            return Ok(());
+        }
+        let status = res.status();
+        if let Some(code) = res.headers().get("X-Dufs-Error-Code").cloned() {
+            representation
+                .headers_mut()
+                .insert("X-Dufs-Error-Code", code);
+        }
+        *representation.status_mut() = if status == StatusCode::NO_CONTENT {
+            StatusCode::OK
+        } else {
+            status
+        };
+        representation.headers_mut().insert(
+            "Content-Location",
+            HeaderValue::from_str(&encode_uri(&format!(
+                "{}{}",
+                self.args.uri_prefix,
+                normalize_path(relative)
+            )))?,
+        );
+        prefer.applied(&mut representation, false, false, true);
+        *res = representation;
+        Ok(())
     }
 
     async fn lock_write_paths(
@@ -978,11 +1228,9 @@ impl Server {
             io::copy(&mut original, &mut file).await?;
             file.seek(SeekFrom::Start(offset)).await?;
         }
-        let stream = IncomingStream::new(req.into_body());
-        let body_reader = StreamReader::new(stream.map_err(io::Error::other));
-        pin_mut!(body_reader);
-
-        io::copy(&mut body_reader, &mut file).await?;
+        if !http_digest::copy_upload(req, &mut file, res).await? {
+            return Ok(());
+        }
         file.flush().await?;
         if let Some(meta) = old_meta {
             file.set_permissions(upload_permissions(meta)).await?;
@@ -1581,6 +1829,15 @@ impl Server {
                         .insert(CONTENT_RANGE, content_range.parse()?);
                     res.headers_mut()
                         .insert(CONTENT_LENGTH, format!("{range_size}").parse()?);
+                    http_digest::response_file_digests(
+                        &mut file,
+                        headers,
+                        res,
+                        size,
+                        head_only,
+                        Some((start, range_size)),
+                    )
+                    .await?;
                     if head_only {
                         return Ok(());
                     }
@@ -1617,6 +1874,10 @@ impl Server {
                     );
                     res.headers_mut()
                         .insert(CONTENT_LENGTH, format!("{content_length}").parse()?);
+                    http_digest::response_file_digests(
+                        &mut file, headers, res, size, head_only, None,
+                    )
+                    .await?;
                     if head_only {
                         return Ok(());
                     }
@@ -1657,6 +1918,15 @@ impl Server {
         } else {
             res.headers_mut()
                 .insert(CONTENT_LENGTH, format!("{size}").parse()?);
+            http_digest::response_file_digests(
+                &mut file,
+                headers,
+                res,
+                size,
+                head_only,
+                Some((0, size)),
+            )
+            .await?;
             if head_only {
                 return Ok(());
             }
@@ -1771,6 +2041,7 @@ impl Server {
         access_paths: AccessPaths,
         anonymous: bool,
         selection: &DavSelection,
+        via_token: bool,
         res: &mut Response,
     ) -> Result<()> {
         let depth: u32 = match headers.get("depth") {
@@ -1811,6 +2082,9 @@ impl Server {
             Some(v) => vec![v],
             None => vec![],
         };
+        if depth == 1 && DavPrefer::parse(headers).noroot {
+            paths.clear();
+        }
         if depth == 1 {
             // Preserve anonymous collection-name discovery for legacy WebDAV
             // clients, but evaluate each resource's live properties with its
@@ -1856,14 +2130,17 @@ impl Server {
                 continue;
             }
             match self
-                .dav_representation(&item_path, item.is_dir(), user.clone(), item_access)
+                .dav_item_xml(
+                    &item,
+                    selection,
+                    user.clone(),
+                    item_access,
+                    headers,
+                    via_token,
+                )
                 .await
             {
-                Ok(representation) => output.push_str(&item.to_dav_xml(
-                    self.args.uri_prefix.as_str(),
-                    selection,
-                    &representation,
-                )),
+                Ok(xml) => output.push_str(&xml),
                 Err(error) => {
                     let status = error
                         .downcast_ref::<io::Error>()
@@ -1881,18 +2158,69 @@ impl Server {
         &self,
         path: &Path,
         selection: &DavSelection,
+        headers: &HeaderMap<HeaderValue>,
         res: &mut Response,
     ) -> Result<()> {
         if let Some(pathitem) = self.to_pathitem(path, &self.args.serve_path).await? {
-            let representation = self.dav_representation(path, false, None, None).await?;
             res_multistatus(
                 res,
-                &pathitem.to_dav_xml(self.args.uri_prefix.as_str(), selection, &representation),
+                &self
+                    .dav_item_xml(&pathitem, selection, None, None, headers, false)
+                    .await?,
             );
         } else {
             status_not_found(res);
         }
         Ok(())
+    }
+
+    pub(self) async fn dav_item_xml(
+        &self,
+        item: &PathItem,
+        selection: &DavSelection,
+        user: Option<String>,
+        access: Option<AccessPaths>,
+        headers: &HeaderMap<HeaderValue>,
+        via_token: bool,
+    ) -> Result<String> {
+        let path = self.args.serve_path.join(&item.name);
+        let mut extra = Vec::new();
+        if item.is_dir()
+            && (selection.extension("quota-available-bytes")
+                || selection.extension("quota-used-bytes"))
+        {
+            extra.extend(dav_common::quota_properties(&path).await);
+        }
+        if item.is_dir() {
+            if selection.extension("supported-report-set") {
+                extra.push(("supported-report-set", "<D:supported-report><D:report><D:sync-collection/></D:report></D:supported-report>".into()));
+            }
+            if selection.extension("sync-token") {
+                if matches!(selection, DavSelection::Names) {
+                    extra.push(("sync-token", String::new()));
+                } else if let Some(access) = access.clone() {
+                    if let Ok(token) = self
+                        .sync_collection_token(&path, user.clone(), access, via_token)
+                        .await
+                    {
+                        extra.push(("sync-token", escape_str_pcdata(&token).to_string()));
+                    }
+                }
+            }
+        }
+        let representation = if selection.needs_representation() {
+            self.dav_representation(&path, item.is_dir(), user, access)
+                .await?
+        } else {
+            Response::default()
+        };
+        Ok(item.to_dav_xml(
+            self.args.uri_prefix.as_str(),
+            selection,
+            &representation,
+            &extra,
+            DavPrefer::parse(headers).minimal,
+        ))
     }
 
     // Live HTTP properties are derived from the same representation as GET.
@@ -2229,6 +2557,7 @@ impl Server {
         user: Option<String>,
         access: AccessPaths,
         body: &[u8],
+        prefer: DavPrefer,
         res: &mut Response,
     ) -> Result<()> {
         let properties = match parse_propertyupdate(body) {
@@ -2246,7 +2575,12 @@ impl Server {
                 return false;
             }
             match name.local_name.as_str() {
-                "resourcetype" | "displayname" => true,
+                "resourcetype"
+                | "displayname"
+                | "quota-available-bytes"
+                | "quota-used-bytes"
+                | "sync-token"
+                | "supported-report-set" => true,
                 "getcontenttype" => representation.headers().contains_key("content-type"),
                 "getcontentlength" => representation.headers().contains_key("content-length"),
                 "getlastmodified" => representation.headers().contains_key("last-modified"),
@@ -2271,6 +2605,11 @@ impl Server {
             }
         }
         let rejected = !denied.is_empty() || !protected_denied.is_empty();
+        if !rejected && prefer.minimal {
+            status_no_content(res);
+            prefer.applied(res, true, false, false);
+            return Ok(());
+        }
         let mut output = format!(
             "<D:response><D:href>{}</D:href>",
             escape_str_pcdata(req_path)
@@ -2411,6 +2750,7 @@ impl Server {
             res,
             self.args.allow_upload,
             self.args.allow_delete,
+            false,
             false,
             false,
             false,
@@ -2826,6 +3166,8 @@ impl PathItem {
         prefix: &str,
         selection: &DavSelection,
         representation: &Response,
+        extra: &[(&str, String)],
+        minimal: bool,
     ) -> String {
         let mut href = encode_uri(&format!("{}{}", prefix, self.name));
         if self.is_dir() && !href.ends_with('/') {
@@ -2872,6 +3214,11 @@ impl PathItem {
                     ok.push_str(&format!("<D:{name}>{value}</D:{name}>\n"));
                 }
             }
+            if matches!(selection, DavSelection::Names) {
+                for (name, _) in extra {
+                    ok.push_str(&format!("<D:{name}/>\n"));
+                }
+            }
         }
         if let DavSelection::Props(names) | DavSelection::All(names) = selection {
             for name in names {
@@ -2884,7 +3231,10 @@ impl PathItem {
                     if matches!(selection, DavSelection::Props(_)) {
                         ok.push_str(&format!("<D:{key}>{value}</D:{key}>\n"));
                     }
-                } else {
+                } else if let Some((key, value)) = extra.iter().find(|(key, _)| dav_name(name, key))
+                {
+                    ok.push_str(&format!("<D:{key}>{value}</D:{key}>\n"));
+                } else if !minimal {
                     missing.push_str(&dav_empty_property(name));
                 }
             }
@@ -3159,7 +3509,9 @@ fn filesystem_status(error: &std::io::Error) -> StatusCode {
         io::ErrorKind::AlreadyExists
         | io::ErrorKind::DirectoryNotEmpty
         | io::ErrorKind::NotADirectory => StatusCode::CONFLICT,
-        io::ErrorKind::StorageFull => StatusCode::INSUFFICIENT_STORAGE,
+        io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => {
+            StatusCode::INSUFFICIENT_STORAGE
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -3246,16 +3598,27 @@ fn add_cors(res: &mut Response) {
 
 struct DavIfGroup {
     resource: Option<String>,
-    lists: Vec<Vec<(bool, Option<ETag>)>>,
+    lists: Vec<Vec<(bool, DavCondition)>>,
+}
+
+enum DavCondition {
+    Tag(ETag),
+    Token(String),
 }
 
 impl DavIfGroup {
-    fn matches(&self, current: Option<&ETag>) -> bool {
+    fn needs_sync(&self) -> bool {
+        self.lists.iter().flatten().any(|(_, cond)| matches!(cond, DavCondition::Token(token) if token.starts_with("urn:uuid:")))
+    }
+    fn matches(&self, current: Option<&ETag>, sync: Option<&str>) -> bool {
         self.lists.iter().any(|list| {
             list.iter().all(|(negated, tag)| {
-                let matches = tag.as_ref().zip(current).is_some_and(|(tag, current)| {
-                    !IfNoneMatch::from(tag.clone()).precondition_passes(current)
-                });
+                let matches = match tag {
+                    DavCondition::Tag(tag) => current.is_some_and(|current| {
+                        !IfNoneMatch::from(tag.clone()).precondition_passes(current)
+                    }),
+                    DavCondition::Token(token) => sync == Some(token.as_str()),
+                };
                 matches != *negated
             })
         })
@@ -3317,8 +3680,7 @@ fn parse_dav_if(mut input: &str) -> Result<Vec<DavIfGroup>> {
                         return Err(anyhow!("Invalid state token"));
                     }
                     input = rest;
-                    // No state token matches on this non-locking server.
-                    None
+                    DavCondition::Token(value.to_owned())
                 } else if let Some(rest) = input.strip_prefix('[') {
                     let first = rest
                         .find('"')
@@ -3331,7 +3693,7 @@ fn parse_dav_if(mut input: &str) -> Result<Vec<DavIfGroup>> {
                     input = rest[end + 1..]
                         .strip_prefix(']')
                         .ok_or_else(|| anyhow!("Invalid entity tag"))?;
-                    Some(rest[..=end].parse::<ETag>()?)
+                    DavCondition::Tag(rest[..=end].parse::<ETag>()?)
                 } else {
                     return Err(anyhow!("Invalid If condition"));
                 };
@@ -3372,6 +3734,32 @@ fn dav_name(name: &OwnedName, local: &str) -> bool {
 }
 
 impl DavSelection {
+    fn needs_representation(&self) -> bool {
+        match self {
+            Self::Props(names) => names.iter().any(|name| {
+                name.namespace.as_deref() == Some("DAV:")
+                    && matches!(
+                        name.local_name.as_str(),
+                        "getcontenttype"
+                            | "getcontentlength"
+                            | "getlastmodified"
+                            | "getetag"
+                            | "getcontentlanguage"
+                    )
+            }),
+            _ => true,
+        }
+    }
+
+    fn extension(&self, property: &str) -> bool {
+        match self {
+            Self::Names => true,
+            Self::All(names) | Self::Props(names) => {
+                names.iter().any(|name| dav_name(name, property))
+            }
+        }
+    }
+
     fn parse(body: &[u8]) -> Result<Self> {
         if body.is_empty() {
             return Ok(Self::All(vec![]));
@@ -3784,6 +4172,7 @@ fn set_webdav_headers(
     file: bool,
     dir: bool,
     missing: bool,
+    search: bool,
 ) {
     let mut methods = vec!["GET", "HEAD", "OPTIONS", "CHECKAUTH", "LOGOUT"];
     if file || dir {
@@ -3802,6 +4191,14 @@ fn set_webdav_headers(
     if upload && missing {
         methods.push("MKCOL");
     }
+    if dir && search {
+        methods.push("SEARCH");
+        res.headers_mut()
+            .insert("DASL", HeaderValue::from_static("<DAV:basicsearch>"));
+    }
+    if dir {
+        methods.push("REPORT");
+    }
     if upload && (file || dir) {
         methods.push("COPY");
     }
@@ -3813,9 +4210,15 @@ fn set_webdav_headers(
     }
     res.headers_mut()
         .insert("Allow", HeaderValue::from_str(&methods.join(", ")).unwrap());
-    if file || dir {
-        res.headers_mut()
-            .insert("DAV", HeaderValue::from_static("1, 3"));
+    if file || dir || (missing && upload) {
+        res.headers_mut().insert(
+            "DAV",
+            HeaderValue::from_static(if upload && (dir || missing) {
+                "1, 3, extended-mkcol"
+            } else {
+                "1, 3"
+            }),
+        );
     }
 }
 

@@ -635,6 +635,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rstest",
+ "rustix",
  "rustls-pki-types",
  "serde",
  "serde-saphyr",
@@ -651,6 +652,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "walkdir",
+ "windows-sys 0.61.2",
  "xml-rs",
  "zip",
 ]

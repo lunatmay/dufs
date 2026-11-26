@@ -55,6 +55,12 @@ ed25519-dalek = "3.0.0"
 hex = "0.4.3"
 tempfile = "3"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [features]
 default = ["tls"]
 tls = ["tokio-rustls"]
