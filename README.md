@@ -15,12 +15,53 @@ Dufs is a distinctive utility file server that supports static serving, uploadin
 - Resumable/partial uploads/downloads
 - Access control
 - Support https
-- Support webdav
+- [WebDAV](#webdav-protocol-support) (Class 1 and Class 3; no Class 2 locking)
 - Easy to use with curl
+
+## WebDAV protocol support
+
+This fork implements a filesystem-backed, non-locking WebDAV server. It follows the standard HTTP and WebDAV interfaces rather than requiring a fork-specific client.
+
+### Compliance classes
+
+| Class ([RFC 4918](https://www.rfc-editor.org/rfc/rfc4918)) | Status | Description |
+| --- | --- | --- |
+| 1 | Supported | Resource and collection management, property queries, property-update responses, and conditional requests. |
+| 2 | **Not supported** | No WebDAV resource locks. `LOCK` and `UNLOCK` return `405 Method Not Allowed`; no fictitious lock tokens are issued or acknowledged. |
+| 3 | Supported | RFC 4918 revision of the WebDAV protocol, without Class 2 locking. |
+
+`OPTIONS` advertises `DAV: 1, 3` for directory-backed WebDAV resources, with `extended-mkcol` where collection creation is available. `Allow` describes the available methods. Tagged and untagged `If` conditions support ETags and collection synchronization tokens; lock tokens never match.
+
+The supported classes describe the implemented protocol behavior, not independent certification. Development and protocol regression tests currently target Linux amd64; full third-party WebDAV conformance and other operating system behavior have not been independently verified.
+
+### Protocol and RFC extensions
+
+| RFC | Implemented behavior | Limitations |
+| --- | --- | --- |
+| [9110](https://www.rfc-editor.org/rfc/rfc9110) — HTTP semantics | GET, HEAD, ranges, PUT, DELETE, ETags, and conditional requests. | Strong ETags are derived from filesystem metadata rather than content hashes. |
+| [4918](https://www.rfc-editor.org/rfc/rfc4918) — WebDAV | PROPFIND (`prop`, `allprop`, `include`, `propname`), PROPPATCH, MKCOL, COPY, MOVE, DELETE, and WebDAV `If`. | Class 2 is excluded; arbitrary dead properties are not persisted; infinite-depth PROPFIND and recursive copying of symlink-containing collections are not supported. |
+| [5789](https://www.rfc-editor.org/rfc/rfc5789) — HTTP PATCH | Atomic offset-based patch documents (`application/vnd.dufs.offset-patch`). | A Dufs-specific document format, not JSON Patch or a generic byte-range PATCH standard. |
+| [4331](https://www.rfc-editor.org/rfc/rfc4331) — Quota and size properties | `DAV:quota-available-bytes` and `DAV:quota-used-bytes` on collections; storage exhaustion returns 507. | Reports operating-system volume capacity; no separate per-user or per-directory quota database. |
+| [8144](https://www.rfc-editor.org/rfc/rfc8144) — Prefer | `return=minimal` for property queries and successful property/extended collection changes; `depth-noroot` for Depth 1 PROPFIND; `return=representation` for supported writes and failed conditional writes. | Preferences are applied only where supported and reported in `Preference-Applied`; a representation is returned only where readable and available. |
+| [9530](https://www.rfc-editor.org/rfc/rfc9530) — Digest fields | SHA-256 and SHA-512 `Content-Digest` / `Repr-Digest` for requested file GET, HEAD and ranges; supplied PUT/PATCH digests are validated before publishing. | Multipart content digests and digests for generated directory/XML responses are omitted. |
+| [6578](https://www.rfc-editor.org/rfc/rfc6578) — Collection synchronization | `REPORT` with `DAV:sync-collection`, `DAV:sync-token`, `DAV:supported-report-set`, and synchronization-token `If` conditions. | Immediate members only (`sync-level` 1); no infinite-level traversal or partial-token paging; bounded process-local history. |
+| [5323](https://www.rfc-editor.org/rfc/rfc5323) — SEARCH | `DAV:basicsearch`, property selection, scope/depth, comparison and Boolean operators, LIKE, sorting, and limits. Discovered through `DASL: <DAV:basicsearch>`. | Requires `--allow-search`. No optional full-text search, language matching, typed literals, case-folded search, query-schema discovery, or multiple scopes. |
+| [5689](https://www.rfc-editor.org/rfc/rfc5689) — Extended MKCOL | XML MKCOL for the ordinary DAV collection type; property errors roll back the entire creation. | No special collection types or custom property persistence. Unsupported types and properties are rejected explicitly. |
+
+### Operational and interoperability limits
+
+- Collection PROPFIND supports `Depth: 0` and `Depth: 1`. An infinite depth (including the implicit default when Depth is absent) is rejected with the standard `DAV:propfind-finite-depth` error. Single-file serving mode does not advertise the collection protocol.
+- PROPPATCH reports per-property status transactionally. Protected live properties and arbitrary dead-property writes are rejected; optional properties such as `DAV:creationdate` are not implemented.
+- MKCOL, PUT, COPY, and MOVE require an existing parent collection. COPY and MOVE operate within the server. Recursive operations remain subject to the configured access rules. A failed recursive COPY is rolled back rather than completing a partial copy. Recursive COPY of a collection containing symbolic links is rejected. Links outside the serving root are denied by default; following them is a separate administrator-configured server policy, not a WebDAV requirement.
+- PUT and offset PATCH use temporary files and atomic replacement. Interrupted updates leave the previous complete file intact. Conditional write serialization is process-local: use one server instance per writable storage area, and do not expect it to coordinate unrelated processes or provide transactions spanning multiple resources.
+- RFC 6578 history is bounded: up to 16 collection/user views, 4,096 immediate members, 128 revision tokens, and 8,192 changed-member records per view. Restart, eviction, or external changes that cannot be reconstructed reliably invalidate tokens. Clients receive `403` with `DAV:valid-sync-token` and must make a new initial report. An unrepresentable result limit returns 507. Direct external file edits are observed during scans; transient external changes concurrent with server writes cannot be guaranteed without a filesystem change journal.
+- SEARCH is bounded to 10,000 visited resources, 1,000 returned records, and 8 MiB of retained result data per request. Truncated results include a 507 status for the search arbiter. SEARCH and REPORT do not grant additional access privileges.
+
+Other WebDAV extensions are not currently implemented, including DeltaV versioning (RFC 3253), WebDAV ACL (RFC 3744), current-user-principal (RFC 5397), redirect references (RFC 4437), bindings (RFC 5842), POST-based member creation (RFC 5995), CalDAV (RFC 4791), and CardDAV (RFC 6352). Dufs's own access controls remain separate from WebDAV ACL.
 
 ## Install
 
-This fork publishes Docker images to GitHub Container Registry on version tags.
+This fork publishes Linux amd64 Docker images to GitHub Container Registry on version tags.
 The cargo, Homebrew and binary installations below refer to the original upstream version, not the JoyPlay save-sync fork.
 
 ### With cargo
@@ -209,51 +250,6 @@ Resumable downloads
 ```sh
 curl -C- -o file http://127.0.0.1:5000/file
 ```
-
-### WebDAV
-
-Directory-backed resources implement non-locking WebDAV (RFC 4918 classes 1 and 3).
-`OPTIONS` advertises `DAV: 1, 3` and the methods available for the resource;
-`extended-mkcol` is advertised where collection creation is available.
-Class 2 is not supported: `LOCK` and `UNLOCK` return 405 rather than issuing
-or acknowledging fictitious tokens.
-
-- `PROPFIND` supports property selection, `allprop`, `include`, and
-  `propname`. Specify `Depth: 0` or `Depth: 1` for collections. The default
-  infinite depth is rejected with the standard finite-depth error.
-- `PROPPATCH` reports per-property status and is transactional. This
-  filesystem backend does not persist arbitrary dead properties; setting
-  these properties or modifying protected live properties is forbidden.
-- `MKCOL`, `PUT`, `COPY`, and `MOVE` require an existing parent collection.
-  Create any missing parent collections first.
-- Recursive collection operations remain subject to configured access rules.
-  Recursive copying of symlink-containing collections is not supported.
-- `If` supports tagged and untagged conditional lists with entity tags and
-  collection synchronization tokens; lock tokens never match.
-
-### WebDAV and HTTP extensions
-
-| RFC | Supported behavior |
-| --- | --- |
-| 4331 | `DAV:quota-available-bytes` and `DAV:quota-used-bytes` on collections; operating-system volume capacity, not a separate user quota database. Storage exhaustion returns 507. |
-| 8144 | `Prefer: return=minimal` for property queries and successful property/extended collection changes, `depth-noroot` for Depth 1 PROPFIND, `return=representation` for supported file/collection writes and failed conditional writes. Applied preferences are returned in `Preference-Applied`. |
-| 9530 | SHA-256 and SHA-512 `Content-Digest`/`Repr-Digest` for requested file GET/HEAD/ranges, and validation of supplied upload/patch digests before atomic publication. Multipart content-digest and digests for generated directory/XML responses are omitted. |
-| 6578 | `REPORT` with `DAV:sync-collection`, `DAV:sync-token`, `DAV:supported-report-set`, and synchronization-token `If` conditions. Immediate-member synchronization only (level 1); no infinite-level traversal or partial-token paging. |
-| 5323 | `SEARCH` with `DAV:basicsearch` when `--allow-search` is enabled; property selection, scope/depth, comparison and Boolean operators, LIKE, ordering and limits. No optional full-text, language matching, typed literals, case-folded search, query-schema discovery or multiple scopes. |
-| 5689 | XML `MKCOL` supports the normal DAV collection type. Unsupported resource types or properties receive per-property errors and no collection is created. Arbitrary dead properties are not stored. |
-
-Synchronization history is bounded and process-local: up to 16 collection/user
-views, 4096 immediate members per view, 128 revision tokens and 8192 changed
-member records per view. Old tokens can expire after restart, eviction, or
-external directory modifications that cannot be reconstructed reliably. The
-client receives `DAV:valid-sync-token` and must request a fresh initial report;
-an unrepresentable result limit returns 507. Direct external file edits are
-detected during scans, but transient external changes concurrent with server
-writes cannot be guaranteed without a filesystem change journal.
-
-Search is bounded to 10,000 visited resources, 1,000 returned records and 8 MiB
-of retained result data per request; truncated results carry a 507 status for
-the arbiter. Neither SEARCH nor REPORT changes access privileges.
 
 ### Offset PATCH extension
 
