@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.47.1] - 2026-11-26
+
+### JoyPlay fork
+
+- Implement non-locking WebDAV Class 1 and Class 3; explicitly reject Class 2 locks.
+- Add atomic conditional writes, collection operations, and standard WebDAV property/status handling.
+- Add RFC 4331, 8144, 9530, 6578, 5323, and 5689 extensions with documented limitations.
+- Publish Linux amd64 Docker images to GitHub Container Registry on version tags.
+
 ## [0.47.0] - 2026-10-17
 
 ### Features
