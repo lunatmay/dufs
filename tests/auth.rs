@@ -258,7 +258,7 @@ fn auth_nest(
     let resp = send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user3", "pass3")?;
     assert_eq!(resp.status(), 201);
     let resp = send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user", "pass")?;
-    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.status(), 204);
     Ok(())
 }
 
@@ -362,7 +362,9 @@ fn auth_partial_index(
 fn no_auth_propfind_dir(
     #[with(&["--auth", "admin:admin@/:rw", "--auth", "@/dir-assets", "-A"])] server: TestServer,
 ) -> Result<(), Error> {
-    let resp = fetch!(b"PROPFIND", server.url()).send()?;
+    let resp = fetch!(b"PROPFIND", server.url())
+        .header("Depth", "1")
+        .send()?;
     assert_eq!(resp.status(), 207);
     let body = resp.text()?;
     assert!(body.contains("<D:href>/dir-assets/</D:href>"));
@@ -375,7 +377,11 @@ fn auth_propfind_dir(
     #[with(&["--auth", "admin:admin@/:rw", "--auth", "user:pass@/dir-assets", "-A"])]
     server: TestServer,
 ) -> Result<(), Error> {
-    let resp = send_with_digest_auth(fetch!(b"PROPFIND", server.url()), "user", "pass")?;
+    let resp = send_with_digest_auth(
+        fetch!(b"PROPFIND", server.url()).header("Depth", "1"),
+        "user",
+        "pass",
+    )?;
     assert_eq!(resp.status(), 207);
     let body = resp.text()?;
     assert!(body.contains("<D:href>/dir-assets/</D:href>"));
@@ -627,7 +633,7 @@ fn auth_alias_case_directory(
         let url = format!("{}protected/new.txt", server.url());
         let resp =
             send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user", "pass")?;
-        assert_eq!(resp.status(), 201);
+        assert_eq!(resp.status(), 409);
     }
 
     Ok(())
@@ -718,7 +724,7 @@ fn auth_anonymous_no_precedence(
     assert_eq!(resp.status(), 401);
 
     let resp = send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user", "pass")?;
-    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.status(), 204);
 
     Ok(())
 }
@@ -930,7 +936,7 @@ fn recursive_ops_allowed_without_restricted_descendant(
         .basic_auth("user", Some("pass"))
         .header("Destination", format!("{}dir3-moved", server.url()))
         .send()?;
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 201);
     assert!(!server.path().join("dir3").exists());
     assert!(server.path().join("dir3-moved").exists());
     assert!(server.path().join("dir1/test.txt").exists());

@@ -324,22 +324,31 @@ impl AccessControl {
         method: &Method,
         root: &Path,
     ) -> bool {
+        self.access_for(user, path, method, root).await.is_some()
+    }
+
+    pub async fn access_for(
+        &self,
+        user: Option<&str>,
+        path: &str,
+        method: &Method,
+        root: &Path,
+    ) -> Option<AccessPaths> {
         if self.empty {
-            return true;
+            return Some(AccessPaths::new(AccessPerm::ReadWrite));
         }
         let access_paths = match user {
             Some(user) => match self.users.get(user) {
                 Some((_, access_paths)) => access_paths,
-                None => return false,
+                None => return None,
             },
             None => match self.anonymous.as_ref() {
                 Some(access_paths) => access_paths,
-                None => return false,
+                None => return None,
             },
         };
         self.guard_with_target(access_paths, path, method, root)
             .await
-            .is_some()
     }
 
     /// Whether `user` may read `path` according to the complete rule tree.

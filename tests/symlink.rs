@@ -188,7 +188,7 @@ fn move_retarget_denied(
             format!("{}public/staging/renamed", server.url()),
         )
         .send()?;
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 201);
     let resp = fetch!(
         b"GET",
         format!("{}public/staging/renamed/benign.txt", server.url())
@@ -239,7 +239,7 @@ fn symlink_outside_root_follows_request_path(
         .basic_auth("alice", Some("alice"))
         .body("through-link")
         .send()?;
-    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.status(), 204);
     assert_eq!(
         std::fs::read_to_string(outside.path().join("secret.txt"))?,
         "through-link"

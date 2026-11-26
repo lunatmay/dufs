@@ -207,7 +207,6 @@ class Uploader {
     this.speedAmounts = [];
     this.speedTimes = [];
     this.currentSpeed = 0;
-    this.uploadOffset = 0;
     this.lastUptime = 0;
     this.name = [...pathParts, file.name].join("/");
     this.idx = Uploader.globalIdx++;
@@ -255,8 +254,14 @@ class Uploader {
     Uploader.runQueue();
   }
 
-  ajax() {
+  async ajax() {
     const { url } = this;
+    try {
+      await ensureParentCollections(url);
+    } catch (err) {
+      this.fail(err.message);
+      return;
+    }
 
     this.startTime = Date.now();
     this.lastUptime = this.startTime;
@@ -290,29 +295,15 @@ class Uploader {
     })
     ajax.addEventListener("error", () => this.fail(), false);
     ajax.addEventListener("abort", () => this.fail(), false);
-    if (this.uploadOffset > 0) {
-      ajax.open("PATCH", url);
-      ajax.setRequestHeader("X-Update-Range", "append");
-      ajax.send(this.file.slice(this.uploadOffset));
-    } else {
-      ajax.open("PUT", url);
-      ajax.send(this.file);
-      // setTimeout(() => ajax.abort(), 3000);
-    }
+    ajax.open("PUT", url);
+    ajax.send(this.file);
   }
 
-  async retry() {
-    const { url } = this;
-    let res = await fetch(url, {
-      method: "HEAD",
-    });
-    let uploadOffset = 0;
-    if (res.status == 200) {
-      let value = res.headers.get("content-length");
-      uploadOffset = parseInt(value) || 0;
-    }
-    this.uploadOffset = uploadOffset;
-    this.ajax();
+  retry() {
+    // PUT is atomic; the existing file may belong to an earlier upload.
+    failUploaders.delete(this.idx);
+    Uploader.queues.push(this);
+    Uploader.runQueue();
   }
 
   progress(event) {
@@ -320,7 +311,7 @@ class Uploader {
     this.calcSpeed(now - this.startTime, event.loaded);
     if (now - this.lastUptime < 300) return; // throttle update for safari
     this.lastUptime = now;
-    const uploadedSize = event.loaded + this.uploadOffset;
+    const uploadedSize = event.loaded;
     const [speedValue, speedUnit] = formatFileSize(this.currentSpeed);
     this.$status.textContent = "↑";
     this.$percent.textContent = formatPercent((uploadedSize / this.file.size) * 100);
@@ -883,6 +874,26 @@ async function movePath(index) {
   }
 }
 
+async function ensureParentCollections(url) {
+  const target = new URL(url, location.href);
+  const parts = target.pathname.slice(DATA.uri_prefix.length).split("/");
+  parts.pop();
+  let parent = target.origin + DATA.uri_prefix;
+  for (const part of parts) {
+    if (!part) continue;
+    parent += part + "/";
+    const lookup = { method: "PROPFIND", headers: { "Depth": "0" } };
+    const check = await fetch(parent, lookup);
+    if (check.status === 404) {
+      const response = await fetch(parent, { method: "MKCOL" });
+      // Another upload may have created the collection since PROPFIND.
+      await assertResOK(response.status === 405 ? await fetch(parent, lookup) : response);
+    } else {
+      await assertResOK(check);
+    }
+  }
+}
+
 async function doMovePath(fileUrl) {
   const fileUrlObj = new URL(fileUrl);
 
@@ -906,6 +917,7 @@ async function doMovePath(fileUrl) {
         return;
       }
     }
+    await ensureParentCollections(newFileUrl);
     const res2 = await fetch(fileUrl, {
       method: "MOVE",
       headers: {
@@ -972,6 +984,7 @@ async function createFolder(name) {
   const url = newUrl(name);
   try {
     await checkAuth();
+    await ensureParentCollections(url);
     const res = await fetch(url, {
       method: "MKCOL",
     });
@@ -992,6 +1005,7 @@ async function createFile(name) {
   const url = newUrl(name);
   try {
     await checkAuth();
+    await ensureParentCollections(url);
     const res = await fetch(url, {
       method: "PUT",
       body: "",

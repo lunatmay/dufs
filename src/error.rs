@@ -24,6 +24,7 @@ pub enum DufsErrorCode {
     InvalidUploadOffset,
     InvalidDepth,
     InvalidDestination,
+    MissingUploadOffset,
     // 403
     Forbidden,
     ReadonlyDescendant,
@@ -35,7 +36,6 @@ pub enum DufsErrorCode {
     // 404
     ArchiveDisabled,
     // 405
-    MissingUploadOffset,
     AlreadyExists,
     MethodNotAllowed,
     // 412
@@ -71,15 +71,12 @@ impl DufsErrorCode {
     pub const fn status(self) -> StatusCode {
         use DufsErrorCode::*;
         match self {
-            InvalidPath | InvalidUploadOffset | InvalidDepth | InvalidDestination => {
-                StatusCode::BAD_REQUEST
-            }
+            InvalidPath | InvalidUploadOffset | InvalidDepth | InvalidDestination
+            | MissingUploadOffset => StatusCode::BAD_REQUEST,
             Forbidden | ReadonlyDescendant | UploadDisabled | DeleteDisabled | HashDisabled
             | IsADirectory | InternalError => StatusCode::FORBIDDEN,
             ArchiveDisabled => StatusCode::NOT_FOUND,
-            MissingUploadOffset | AlreadyExists | MethodNotAllowed => {
-                StatusCode::METHOD_NOT_ALLOWED
-            }
+            AlreadyExists | MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             PreconditionFailed | DestinationExists => StatusCode::PRECONDITION_FAILED,
         }
     }

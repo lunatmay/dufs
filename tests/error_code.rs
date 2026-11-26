@@ -47,7 +47,7 @@ fn invalid_upload_offset(#[with(&["-A"])] server: TestServer) -> Result<(), Erro
     assert_eq!(error_code(&resp), Some("invalid-upload-offset"));
 
     let resp = fetch!(b"PATCH", &url).body("abc").send()?;
-    assert_eq!(resp.status(), 405);
+    assert_eq!(resp.status(), 400);
     assert_eq!(error_code(&resp), Some("missing-upload-offset"));
     Ok(())
 }
@@ -93,8 +93,8 @@ fn copy_directory(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     let resp = fetch!(b"COPY", format!("{}dir1/", server.url()))
         .header("Destination", format!("{}copied", server.url()))
         .send()?;
-    assert_eq!(resp.status(), 403);
-    assert_eq!(error_code(&resp), Some("is-a-directory"));
+    assert_eq!(resp.status(), 201);
+    assert!(error_code(&resp).is_none());
     Ok(())
 }
 

@@ -63,7 +63,7 @@ fn allow_delete_no_override(#[with(&["--allow-delete"])] server: TestServer) -> 
 fn allow_upload_delete_can_override(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     let url = format!("{}index.html", server.url());
     let resp = fetch!(b"PUT", &url).body(b"abc".to_vec()).send()?;
-    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.status(), 204);
     Ok(())
 }
 

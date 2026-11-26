@@ -210,13 +210,39 @@ Resumable downloads
 curl -C- -o file http://127.0.0.1:5000/file
 ```
 
-Resumable uploads
+### WebDAV
 
-```sh
-upload_offset=$(curl -I -s http://127.0.0.1:5000/file | tr -d '\r' | sed -n 's/content-length: //p')
-dd skip=$upload_offset if=file status=none ibs=1 | \
-  curl -X PATCH -H "X-Update-Range: append" --data-binary @- http://127.0.0.1:5000/file
-```
+Directory-backed resources implement non-locking WebDAV (RFC 4918 classes 1 and 3).
+`OPTIONS` advertises `DAV: 1, 3` and the methods available for the resource.
+Class 2 is not supported: `LOCK` and `UNLOCK` return 405 rather than issuing
+or acknowledging fictitious tokens.
+
+- `PROPFIND` supports property selection, `allprop`, `include`, and
+  `propname`. Specify `Depth: 0` or `Depth: 1` for collections. The default
+  infinite depth is rejected with the standard finite-depth error.
+- `PROPPATCH` reports per-property status and is transactional. This
+  filesystem backend does not persist arbitrary dead properties; setting
+  these properties or modifying protected live properties is forbidden.
+- `MKCOL`, `PUT`, `COPY`, and `MOVE` require an existing parent collection.
+  Create any missing parent collections first.
+- Recursive collection operations remain subject to configured access rules.
+  Recursive copying of symlink-containing collections is not supported.
+- `If` supports tagged and untagged conditional lists with entity tags;
+  state tokens do not match because the server does not implement locking.
+
+### Offset PATCH extension
+
+Dufs also supports an offset-based patch document (not a WebDAV method):
+`Content-Type: application/vnd.dufs.offset-patch` and an
+`X-Update-Range` header of `append` or `bytes=N-`. The document contains
+raw replacement bytes starting at that offset. Existing bytes beyond the
+replacement are preserved. PATCH publishes the entire update atomically;
+an interrupted PUT or PATCH leaves the previous complete file unchanged.
+
+Use a known base representation and its strong ETag in an `If-Match`
+header before sending an offset update. The server's current file length
+alone cannot identify which upload produced its contents. Retrying a full
+PUT is the appropriate recovery after an interrupted upload.
 
 Health checks
 

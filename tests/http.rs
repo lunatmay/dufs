@@ -350,9 +350,9 @@ fn options_dir(server: TestServer) -> Result<(), Error> {
     assert_eq!(resp.status(), 200);
     assert_eq!(
         resp.headers().get("allow").unwrap(),
-        "GET,HEAD,PUT,OPTIONS,DELETE,PATCH,PROPFIND,COPY,MOVE,CHECKAUTH,LOGOUT"
+        "GET, HEAD, OPTIONS, CHECKAUTH, LOGOUT, PROPFIND, PROPPATCH"
     );
-    assert_eq!(resp.headers().get("dav").unwrap(), "1, 2, 3");
+    assert_eq!(resp.headers().get("dav").unwrap(), "1, 3");
     Ok(())
 }
 
@@ -370,9 +370,9 @@ fn put_file(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
 fn put_file_create_dir(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     let url = format!("{}xyz/file1", server.url());
     let resp = fetch!(b"PUT", &url).body(b"abc".to_vec()).send()?;
-    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.status(), 409);
     let resp = reqwest::blocking::get(url)?;
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 404);
     Ok(())
 }
 
@@ -380,9 +380,9 @@ fn put_file_create_dir(#[with(&["-A"])] server: TestServer) -> Result<(), Error>
 fn put_file_create_deep_dir(#[with(&["--allow-upload"])] server: TestServer) -> Result<(), Error> {
     let url = format!("{}newdir/subdir/file1", server.url());
     let resp = fetch!(b"PUT", &url).body(b"abc".to_vec()).send()?;
-    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.status(), 409);
     let resp = reqwest::blocking::get(url)?;
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 404);
     Ok(())
 }
 

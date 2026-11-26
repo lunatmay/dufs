@@ -80,7 +80,7 @@ impl Server {
 
     fn put(&self, path: &str, body: &str) -> Reply {
         let response = self.request("PUT", path, &[], body);
-        assert_eq!(response.status, 201);
+        assert!(matches!(response.status, 201 | 204));
         response
     }
 
@@ -173,7 +173,12 @@ fn sync_probe() {
             ("PUT", "If-Match", "\"invalid\""),
             ("DELETE", "If-Match", "\"invalid\""),
         ] {
-            let rejected = server.request(method, path, &[(name, value)], "{}");
+            let rejected = server.request(
+                method,
+                path,
+                &[(name, value)],
+                if method == "DELETE" { "" } else { "{}" },
+            );
             assert_eq!(rejected.status, 412);
         }
         let replaced = server.request(
@@ -182,7 +187,7 @@ fn sync_probe() {
             &[("If-Match", before.etag())],
             "{\"probe\":true}",
         );
-        assert_eq!(replaced.status, 201);
+        assert_eq!(replaced.status, 204);
         let after = server.request("GET", path, &[], "");
         assert_eq!(after.status, 200);
         assert_eq!(after.body, "{\"probe\":true}");
@@ -220,8 +225,8 @@ fn compare_exchange_put() {
             .map(|h| h.join().unwrap())
             .collect::<Vec<_>>()
     });
-    assert!(results.iter().all(|(r, _)| matches!(r.status, 201 | 412)));
-    let winners: Vec<_> = results.iter().filter(|(r, _)| r.status == 201).collect();
+    assert!(results.iter().all(|(r, _)| matches!(r.status, 204 | 412)));
+    let winners: Vec<_> = results.iter().filter(|(r, _)| r.status == 204).collect();
     assert_eq!(winners.len(), 1);
     let (winner, body) = winners[0];
     let final_reply = server.request("GET", "save", &[], "");
@@ -271,7 +276,7 @@ fn interrupted_upload_keeps_old_file() {
                 "new-content"
             )
             .status,
-        201
+        204
     );
 }
 
@@ -280,7 +285,7 @@ fn same_mtime_writes_change_etag() {
     let server = Server::start();
     let initial = server.put("save", "same");
     let same = server.request("PUT", "save", &[("If-Match", initial.etag())], "same");
-    assert_eq!(same.status, 201);
+    assert_eq!(same.status, 204);
     assert_ne!(same.etag(), initial.etag());
     assert_eq!(server.head("save").etag(), same.etag());
 
@@ -294,7 +299,7 @@ fn same_mtime_writes_change_etag() {
         let old = server.head("save");
         let modified = fs::metadata(&path).unwrap().modified().unwrap();
         let replaced = server.request("PUT", "save", &[("If-Match", old.etag())], "same");
-        assert_eq!(replaced.status, 201);
+        assert_eq!(replaced.status, 204);
         fs::File::open(&path).unwrap().set_modified(time).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
         let new = server.head("save");
@@ -321,7 +326,7 @@ fn delete_and_patch_preconditions() {
                     ""
                 )
                 .status,
-            412,
+            if method == "PUT" { 412 } else { 404 },
             "{method}"
         );
     }
@@ -340,7 +345,7 @@ fn delete_and_patch_preconditions() {
                         method,
                         "save",
                         &[(name, value), ("X-Update-Range", "append")],
-                        "def"
+                        if method == "DELETE" { "" } else { "def" }
                     )
                     .status,
                 412
@@ -451,8 +456,24 @@ fn copy_move_destination_is_serialized() {
             .map(|h| h.join().unwrap())
             .collect::<Vec<_>>()
     });
-    let winners: Vec<_> = results.iter().filter(|r| r.0 == 204).collect();
+    let winners: Vec<_> = results.iter().filter(|r| r.0 == 201).collect();
     assert_eq!(winners.len(), 1);
     assert_eq!(results.iter().filter(|r| r.0 == 412).count(), 1);
     assert_eq!(server.request("GET", "dest", &[], "").body, winners[0].1);
+}
+
+#[test]
+fn interrupted_patch_keeps_complete_representation() {
+    let server = Server::start();
+    let saved = server.put("save", "old-content");
+    let mut stream = server.connect();
+    write!(stream, "PATCH /save HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 4096\r\nIf-Match: {}\r\nX-Update-Range: append\r\n\r\npartial", server.port, saved.etag()).unwrap();
+    wait_until(|| !server.temps().is_empty());
+    assert_eq!(server.request("GET", "save", &[], "").body, "old-content");
+    stream.shutdown(Shutdown::Both).unwrap();
+    drop(stream);
+    wait_until(|| server.temps().is_empty());
+    let after = server.request("GET", "save", &[], "");
+    assert_eq!(after.body, "old-content");
+    assert_eq!(after.etag(), saved.etag());
 }
