@@ -1,8 +1,6 @@
 # Dufs
 
-[![CI](https://github.com/sigoden/dufs/actions/workflows/ci.yaml/badge.svg)](https://github.com/sigoden/dufs/actions/workflows/ci.yaml)
-[![Crates](https://img.shields.io/crates/v/dufs.svg)](https://crates.io/crates/dufs)
-[![Docker Pulls](https://img.shields.io/docker/pulls/sigoden/dufs)](https://hub.docker.com/r/sigoden/dufs)
+[![Docker](https://github.com/lunatmay/dufs/actions/workflows/docker.yaml/badge.svg)](https://github.com/lunatmay/dufs/actions/workflows/docker.yaml)
 
 Dufs is a distinctive utility file server that supports static serving, uploading, searching, accessing control, webdav...
 
@@ -22,6 +20,9 @@ Dufs is a distinctive utility file server that supports static serving, uploadin
 
 ## Install
 
+This fork publishes Docker images to GitHub Container Registry on version tags.
+The cargo, Homebrew and binary installations below refer to the original upstream version, not the JoyPlay save-sync fork.
+
 ### With cargo
 
 ```
@@ -31,7 +32,7 @@ cargo install dufs
 ### With docker
 
 ```
-docker run -v `pwd`:/data -p 5000:5000 --rm sigoden/dufs /data -A
+docker run -v `pwd`:/data -p 5000:5000 --rm ghcr.io/lunatmay/dufs:latest /data -A
 ```
 
 ### With [Homebrew](https://brew.sh)

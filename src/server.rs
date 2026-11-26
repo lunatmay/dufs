@@ -34,15 +34,16 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::Metadata;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::atomic::{self, AtomicBool};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::SystemTime;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tokio::{fs, io};
 
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -60,7 +61,7 @@ const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
 const INDEX_NAME: &str = "index.html";
 const BUF_SIZE: usize = 65536;
 const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
-const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
+const UPLOAD_TEMP_PREFIX: &str = ".dufs-upload-";
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
@@ -70,6 +71,7 @@ pub struct Server {
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
+    write_locks: Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>,
 }
 
 impl Server {
@@ -101,6 +103,7 @@ impl Server {
             single_file_req_paths,
             assets_prefix,
             html,
+            write_locks: Mutex::default(),
         })
     }
 
@@ -117,7 +120,17 @@ impl Server {
             http_log_data.insert("remote_addr".to_string(), addr.ip().to_string());
         }
 
-        let mut res = match self.clone().handle(req).await {
+        let result = if is_write_method(req.method()) {
+            // A disconnected client must not release a lock while an async filesystem
+            // operation is still completing. Dropping the JoinHandle leaves it running.
+            tokio::spawn(self.clone().handle(req))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+        } else {
+            self.clone().handle(req).await
+        };
+        let mut res = match result {
             Ok(res) => {
                 http_log_data.insert("status".to_string(), res.status().as_u16().to_string());
                 if !uri.path().starts_with(assets_prefix) {
@@ -187,6 +200,23 @@ impl Server {
         let mut query_params: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+
+        // Hold both paths through the precondition check and filesystem change.
+        let _write_guards = if is_write_method(&method) {
+            let destination = if matches!(method.as_str(), "MOVE" | "COPY") {
+                self.extract_destination_header(headers)
+                    .and_then(|v| self.resolve_path(&v))
+                    .and_then(|v| self.join_path(&v))
+            } else {
+                None
+            };
+            match self.join_path(&relative_path) {
+                Some(path) => Some(self.lock_write_paths(&path, destination.as_deref()).await),
+                None => None,
+            }
+        } else {
+            None
+        };
 
         let (user, access_paths, via_token, stale) = self
             .args
@@ -275,7 +305,19 @@ impl Server {
 
         let path = path.as_path();
 
-        let meta = fs::metadata(path).await.ok();
+        let meta = match fs::metadata(path).await {
+            Ok(meta) => Some(meta),
+            Err(err)
+                if is_write_method(&method)
+                    && !matches!(
+                        err.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+            {
+                return Err(err.into());
+            }
+            Err(_) => None,
+        };
         let (is_miss, is_dir, is_file, size) = match &meta {
             Some(meta) => (false, meta.is_dir(), meta.is_file(), meta.len()),
             None => (true, false, false, 0),
@@ -438,22 +480,27 @@ impl Server {
                 set_webdav_headers(&mut res);
             }
             Method::PUT => {
-                if is_dir {
-                    DufsErrorCode::IsADirectory.respond(&mut res);
-                } else if !allow_upload {
+                if !allow_upload {
                     DufsErrorCode::UploadDisabled.respond(&mut res);
-                } else if !allow_delete && size > 0 {
-                    DufsErrorCode::DeleteDisabled.respond(&mut res);
                 } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
-                    self.handle_upload(path, None, size, req, &mut res).await?;
+                    if is_dir {
+                        DufsErrorCode::IsADirectory.respond(&mut res);
+                    } else if !allow_delete && size > 0 {
+                        DufsErrorCode::DeleteDisabled.respond(&mut res);
+                    } else {
+                        self.handle_upload(path, None, meta.as_ref(), req, &mut res)
+                            .await?;
+                    }
                 }
             }
             Method::PATCH => {
-                if is_miss {
-                    status_not_found(&mut res);
-                } else if !allow_upload {
+                if !allow_upload {
                     DufsErrorCode::UploadDisabled.respond(&mut res);
-                } else {
+                } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
+                    if is_miss {
+                        status_not_found(&mut res);
+                        return Ok(res);
+                    }
                     let offset = match parse_upload_offset(headers, size) {
                         Ok(v) => v,
                         Err(err) => {
@@ -468,10 +515,7 @@ impl Server {
                                 DufsErrorCode::DeleteDisabled.respond(&mut res);
                                 return Ok(res);
                             }
-                            if !check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
-                                return Ok(res);
-                            }
-                            self.handle_upload(path, Some(offset), size, req, &mut res)
+                            self.handle_upload(path, Some(offset), meta.as_ref(), req, &mut res)
                                 .await?;
                         }
                         None => {
@@ -483,14 +527,14 @@ impl Server {
             Method::DELETE => {
                 if !allow_delete {
                     DufsErrorCode::DeleteDisabled.respond(&mut res);
-                } else if !is_miss {
-                    if is_dir && Self::has_restricted_descendant(&access_paths) {
-                        DufsErrorCode::ReadonlyDescendant.respond(&mut res);
-                    } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
-                        self.handle_delete(path, is_dir, &mut res).await?
+                } else if is_dir && Self::has_restricted_descendant(&access_paths) {
+                    DufsErrorCode::ReadonlyDescendant.respond(&mut res);
+                } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
+                    if is_miss {
+                        status_not_found(&mut res);
+                    } else {
+                        self.handle_delete(path, is_dir, &mut res).await?;
                     }
-                } else {
-                    status_not_found(&mut res);
                 }
             }
             method => match method.as_str() {
@@ -519,35 +563,39 @@ impl Server {
                             return Ok(res);
                         }
                         self.handle_propfind_file(path, &mut res).await?;
-                    } else {
+                    } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
                         status_not_found(&mut res);
                     }
                 }
                 "PROPPATCH" => {
-                    if is_file {
-                        if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
+                    if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
+                        if is_file {
                             self.handle_proppatch(req_path, &mut res).await?;
+                        } else {
+                            status_not_found(&mut res);
                         }
-                    } else {
-                        status_not_found(&mut res);
                     }
                 }
                 "MKCOL" => {
                     if !allow_upload {
                         DufsErrorCode::UploadDisabled.respond(&mut res);
-                    } else if !is_miss {
-                        DufsErrorCode::AlreadyExists.respond(&mut res);
                     } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
-                        self.handle_mkcol(path, &mut res).await?;
+                        if !is_miss {
+                            DufsErrorCode::AlreadyExists.respond(&mut res);
+                        } else {
+                            self.handle_mkcol(path, &mut res).await?;
+                        }
                     }
                 }
                 "COPY" => {
                     if !allow_upload {
                         DufsErrorCode::UploadDisabled.respond(&mut res);
-                    } else if is_miss {
-                        status_not_found(&mut res);
                     } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
-                        self.handle_copy(path, &req, &mut res).await?
+                        if is_miss {
+                            status_not_found(&mut res);
+                        } else {
+                            self.handle_copy(path, &req, &mut res).await?;
+                        }
                     }
                 }
                 "MOVE" => {
@@ -555,12 +603,14 @@ impl Server {
                         DufsErrorCode::UploadDisabled.respond(&mut res);
                     } else if !allow_delete {
                         DufsErrorCode::DeleteDisabled.respond(&mut res);
-                    } else if is_miss {
-                        status_not_found(&mut res);
                     } else if is_dir && Self::has_restricted_descendant(&access_paths) {
                         DufsErrorCode::ReadonlyDescendant.respond(&mut res);
                     } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
-                        self.handle_move(path, &req, &mut res).await?
+                        if is_miss {
+                            status_not_found(&mut res);
+                        } else {
+                            self.handle_move(path, &req, &mut res).await?;
+                        }
                     }
                 }
                 "LOCK" => {
@@ -586,48 +636,112 @@ impl Server {
         Ok(res)
     }
 
+    async fn lock_write_paths(
+        &self,
+        path: &Path,
+        destination: Option<&Path>,
+    ) -> (
+        Vec<OwnedRwLockReadGuard<()>>,
+        Vec<OwnedRwLockWriteGuard<()>>,
+    ) {
+        loop {
+            let keys = write_lock_keys(path, destination).await;
+            let locks = {
+                let mut map = self.write_locks.lock().unwrap();
+                map.retain(|_, lock| lock.strong_count() != 0);
+                keys.iter()
+                    .map(|(key, exclusive)| {
+                        let lock = map.get(key).and_then(Weak::upgrade).unwrap_or_else(|| {
+                            let lock = Arc::new(RwLock::new(()));
+                            map.insert(key.clone(), Arc::downgrade(&lock));
+                            lock
+                        });
+                        (lock, *exclusive)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let (mut reads, mut writes) = (vec![], vec![]);
+            // All requests acquire locks in path order, including two-path operations.
+            for (lock, exclusive) in locks {
+                if exclusive {
+                    writes.push(lock.write_owned().await);
+                } else {
+                    reads.push(lock.read_owned().await);
+                }
+            }
+            if keys == write_lock_keys(path, destination).await {
+                return (reads, writes);
+            }
+            // A queued directory or symlink move may have changed the resolution.
+        }
+    }
+
     async fn handle_upload(
         &self,
         path: &Path,
         upload_offset: Option<u64>,
-        size: u64,
+        old_meta: Option<&Metadata>,
         req: Request,
         res: &mut Response,
     ) -> Result<()> {
-        ensure_path_parent(path).await?;
-        let (mut file, status) = match upload_offset {
-            None => (fs::File::create(path).await?, StatusCode::CREATED),
-            Some(offset) if offset == size => (
-                fs::OpenOptions::new().append(true).open(path).await?,
-                StatusCode::NO_CONTENT,
-            ),
+        let path = upload_target(path).await?;
+        ensure_path_parent(&path).await?;
+        let temp;
+        let mut file = match upload_offset {
+            None => {
+                if let Some(meta) = old_meta {
+                    if !meta.is_file() {
+                        return Err(anyhow!("Cannot replace a non-regular file"));
+                    }
+                    // Atomic replacement must not bypass the old file's write permissions.
+                    fs::OpenOptions::new().write(true).open(&path).await?;
+                }
+                let (file, temp_path) = upload_temp(&path)?;
+                temp = Some(temp_path);
+                fs::File::from_std(file)
+            }
             Some(offset) => {
-                let mut file = fs::OpenOptions::new().write(true).open(path).await?;
-                file.seek(SeekFrom::Start(offset)).await?;
-                (file, StatusCode::NO_CONTENT)
+                temp = None;
+                if old_meta.is_some_and(|meta| offset == meta.len()) {
+                    fs::OpenOptions::new().append(true).open(&path).await?
+                } else {
+                    let mut file = fs::OpenOptions::new().write(true).open(&path).await?;
+                    file.seek(SeekFrom::Start(offset)).await?;
+                    file
+                }
             }
         };
         let stream = IncomingStream::new(req.into_body());
-
-        let body_with_io_error = stream.map_err(io::Error::other);
-        let body_reader = StreamReader::new(body_with_io_error);
-
+        let body_reader = StreamReader::new(stream.map_err(io::Error::other));
         pin_mut!(body_reader);
 
-        let ret = io::copy(&mut body_reader, &mut file).await;
-        let size = fs::metadata(path)
-            .await
-            .map(|v| v.len())
-            .unwrap_or_default();
-        if ret.is_err() {
-            if upload_offset.is_none() && size < RESUMABLE_UPLOAD_MIN_SIZE {
-                let _ = tokio::fs::remove_file(&path).await;
+        let copied = io::copy(&mut body_reader, &mut file).await;
+        // A failed PUT never publishes its temporary file. An interrupted PATCH
+        // retains the bytes received, so drain pending writes before unlocking.
+        if temp.is_some() {
+            if let Err(err) = copied {
+                return Err(err.into());
             }
-            ret?;
         }
-
-        *res.status_mut() = status;
-
+        file.flush().await?;
+        if temp.is_some() {
+            if let Some(meta) = old_meta {
+                file.set_permissions(upload_permissions(meta)).await?;
+            }
+        }
+        finish_write(&file, old_meta).await?;
+        copied?;
+        drop(file);
+        if let Some(temp) = temp {
+            // Persist replaces the destination atomically on Unix and Windows.
+            temp.persist(&path)?;
+        }
+        set_written_etag(&path, res).await;
+        *res.status_mut() = if upload_offset.is_some() {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::CREATED
+        };
         Ok(())
     }
 
@@ -1070,12 +1184,12 @@ impl Server {
         head_only: bool,
         res: &mut Response,
     ) -> Result<()> {
-        let (file, meta) = tokio::join!(fs::File::open(path), fs::metadata(path),);
-        let (mut file, meta) = (file?, meta?);
+        let mut file = fs::File::open(path).await?;
+        let meta = file.metadata().await?;
         let size = meta.len();
         let mut use_range = true;
         let cache_headers = extract_cache_headers(&meta);
-        if !check_preconditions(headers, cache_headers.as_ref(), true, res) {
+        if !check_preconditions(headers, cache_headers.as_ref(), true, true, res) {
             return Ok(());
         }
         if let Some((etag, last_modified)) = cache_headers {
@@ -1110,10 +1224,9 @@ impl Server {
             None
         };
 
-        res.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_str(&get_content_type(path).await?)?,
-        );
+        let content_type = get_content_type(path, &mut file).await?;
+        res.headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_str(&content_type)?);
 
         let filename = try_get_file_name(path)?;
         set_content_disposition(res, true, filename)?;
@@ -1146,7 +1259,6 @@ impl Server {
                 } else {
                     *res.status_mut() = StatusCode::PARTIAL_CONTENT;
                     let boundary = Uuid::new_v4();
-                    let content_type = get_content_type(path).await?;
                     let footer = format!("--{boundary}--\r\n");
 
                     // Compute the exact length up front, so a HEAD request (and
@@ -1427,7 +1539,25 @@ impl Server {
 
         ensure_path_parent(&dest).await?;
 
-        fs::copy(path, &dest).await?;
+        let dest = upload_target(&dest).await?;
+        let old_meta = fs::metadata(&dest).await.ok();
+        if let Some(meta) = &old_meta {
+            if !meta.is_file() {
+                return Err(anyhow!("Cannot replace a non-regular file"));
+            }
+            fs::OpenOptions::new().write(true).open(&dest).await?;
+        }
+        let mut source = fs::File::open(path).await?;
+        let (file, temp) = upload_temp(&dest)?;
+        let mut file = fs::File::from_std(file);
+        io::copy(&mut source, &mut file).await?;
+        file.flush().await?;
+        file.set_permissions(upload_permissions(&source.metadata().await?))
+            .await?;
+        finish_write(&file, old_meta.as_ref()).await?;
+        drop(file);
+        temp.persist(&dest)?;
+        set_written_etag(&dest, res).await;
 
         status_no_content(res);
         Ok(())
@@ -1477,6 +1607,7 @@ impl Server {
         ensure_path_parent(&dest).await?;
 
         fs::rename(path, &dest).await?;
+        set_written_etag(&dest, res).await;
 
         status_no_content(res);
         Ok(())
@@ -1717,6 +1848,9 @@ impl Server {
         for comp in Path::new(path).components() {
             if let Component::Normal(v) = comp {
                 let v = v.to_string_lossy();
+                if is_upload_temp(&v) {
+                    return None;
+                }
                 if cfg!(windows) {
                     let chars: Vec<char> = v.chars().collect();
                     if chars.len() == 2 && chars[1] == ':' && chars[0].is_ascii_alphabetic() {
@@ -2167,15 +2301,23 @@ fn etag_from_metadata(meta: &Metadata) -> Option<String> {
     {
         use std::os::unix::fs::MetadataExt;
         Some(format!(
-            r#""{timestamp}-{size}-{:x}-{:x}""#,
+            r#""{timestamp}-{size}-{:x}-{:x}-{:x}-{:x}""#,
             meta.dev(),
-            meta.ino()
+            meta.ino(),
+            meta.ctime(),
+            meta.ctime_nsec()
         ))
     }
 
     #[cfg(not(unix))]
     {
-        Some(format!(r#""{timestamp}-{size}""#))
+        let created = meta
+            .created()
+            .ok()
+            .and_then(|v| v.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|v| v.as_nanos())
+            .unwrap_or_default();
+        Some(format!(r#""{timestamp}-{size}-{created}""#))
     }
 }
 
@@ -2185,6 +2327,133 @@ fn normalize_path<P: AsRef<Path>>(path: P) -> String {
         path.replace('\\', "/")
     } else {
         path.to_string()
+    }
+}
+
+fn is_write_method(method: &Method) -> bool {
+    matches!(
+        method.as_str(),
+        "PUT" | "PATCH" | "DELETE" | "MKCOL" | "MOVE" | "COPY"
+    )
+}
+
+// Canonicalize the existing prefix even when the final name is not present.
+async fn canonical_write_path(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    let mut missing = vec![];
+    loop {
+        if let Ok(mut canonical) = fs::canonicalize(ancestor).await {
+            for name in missing.into_iter().rev() {
+                canonical.push(name);
+            }
+            return canonical;
+        }
+        match (ancestor.parent(), ancestor.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                ancestor = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+async fn write_lock_keys(path: &Path, dest: Option<&Path>) -> BTreeMap<PathBuf, bool> {
+    let mut keys = BTreeMap::new();
+    for path in std::iter::once(path).chain(dest) {
+        let canonical = canonical_write_path(path).await;
+        // Keep the directory entry locked as well as its resolved target.
+        let entry = match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => canonical_write_path(parent).await.join(name),
+            _ => canonical.clone(),
+        };
+        for key in [path.to_path_buf(), canonical, entry] {
+            #[cfg(windows)]
+            let key = PathBuf::from(key.to_string_lossy().to_lowercase());
+            keys.insert(key.clone(), true);
+            for ancestor in key.ancestors().skip(1) {
+                keys.entry(ancestor.to_path_buf()).or_insert(false);
+            }
+        }
+    }
+    keys
+}
+
+async fn upload_target(path: &Path) -> Result<PathBuf> {
+    // Preserve PUT/COPY's existing behavior of following a final symlink.
+    if fs::symlink_metadata(path)
+        .await
+        .is_ok_and(|m| m.is_symlink())
+    {
+        Ok(fs::canonicalize(path).await?)
+    } else {
+        Ok(path.to_path_buf())
+    }
+}
+
+fn upload_permissions(meta: &Metadata) -> std::fs::Permissions {
+    let permissions = meta.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::Permissions::from_mode(permissions.mode() & 0o777);
+    }
+    #[cfg(not(unix))]
+    permissions
+}
+
+fn upload_temp(path: &Path) -> Result<(std::fs::File, tempfile::TempPath)> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(UPLOAD_TEMP_PREFIX);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    Ok(builder
+        .tempfile_in(path.parent().ok_or_else(|| anyhow!("Missing parent"))?)?
+        .into_parts())
+}
+
+async fn finish_write(file: &fs::File, old_meta: Option<&Metadata>) -> Result<()> {
+    // PATCH keeps its inode; non-Unix filesystems may not expose file identity.
+    // If metadata would produce the same validator, advance mtime and verify it.
+    if let Some(old) = old_meta {
+        let unchanged = |meta: &Metadata| {
+            #[cfg(unix)]
+            {
+                etag_from_metadata(meta) == etag_from_metadata(old)
+            }
+            #[cfg(not(unix))]
+            {
+                meta.modified().ok() <= old.modified().ok()
+            }
+        };
+        if unchanged(&file.metadata().await?) {
+            let time = old.modified()?;
+            let std_file = file.try_clone().await?.into_std().await;
+            for nanos in [1, 1_000_000, 1_000_000_000, 2_000_000_000] {
+                std_file.set_modified(time + std::time::Duration::from_nanos(nanos))?;
+                if !unchanged(&file.metadata().await?) {
+                    break;
+                }
+            }
+            if unchanged(&file.metadata().await?) {
+                return Err(anyhow!("Could not change file validator"));
+            }
+        }
+    }
+    file.sync_all().await?;
+    Ok(())
+}
+
+async fn set_written_etag(path: &Path, res: &mut Response) {
+    if let Ok(meta) = fs::metadata(path).await {
+        if meta.is_file() {
+            if let Some((etag, _)) = extract_cache_headers(&meta) {
+                res.headers_mut().typed_insert(etag);
+            }
+        }
     }
 }
 
@@ -2343,13 +2612,16 @@ enum Precondition {
 fn evaluate_preconditions(
     headers: &HeaderMap<HeaderValue>,
     cache_headers: Option<&(ETag, LastModified)>,
+    exists: bool,
     allow_not_modified: bool,
 ) -> Precondition {
     let if_match = headers.typed_get::<IfMatch>();
     if let Some(if_match) = &if_match {
-        match cache_headers {
-            Some((etag, _)) if if_match.precondition_passes(etag) => {}
-            _ => return Precondition::Failed,
+        if !exists
+            || (!if_match.is_any()
+                && !cache_headers.is_some_and(|(etag, _)| if_match.precondition_passes(etag)))
+        {
+            return Precondition::Failed;
         }
     }
 
@@ -2365,8 +2637,11 @@ fn evaluate_preconditions(
     }
 
     let if_none_match = headers.typed_get::<IfNoneMatch>();
-    if let (Some(if_none_match), Some((etag, _))) = (&if_none_match, cache_headers) {
-        if !if_none_match.precondition_passes(etag) {
+    if let Some(if_none_match) = &if_none_match {
+        if exists
+            && (if_none_match == &IfNoneMatch::any()
+                || cache_headers.is_some_and(|(etag, _)| !if_none_match.precondition_passes(etag)))
+        {
             return if allow_not_modified {
                 Precondition::NotModified
             } else {
@@ -2394,10 +2669,11 @@ fn evaluate_preconditions(
 fn check_preconditions(
     headers: &HeaderMap<HeaderValue>,
     cache_headers: Option<&(ETag, LastModified)>,
+    exists: bool,
     allow_not_modified: bool,
     res: &mut Response,
 ) -> bool {
-    match evaluate_preconditions(headers, cache_headers, allow_not_modified) {
+    match evaluate_preconditions(headers, cache_headers, exists, allow_not_modified) {
         Precondition::Passed => true,
         Precondition::NotModified => {
             if let Some((etag, _)) = cache_headers {
@@ -2423,7 +2699,7 @@ fn check_preconditions_for_meta(
     res: &mut Response,
 ) -> bool {
     let cache_headers = meta.and_then(extract_cache_headers);
-    check_preconditions(headers, cache_headers.as_ref(), false, res)
+    check_preconditions(headers, cache_headers.as_ref(), meta.is_some(), false, res)
 }
 
 fn status_not_found(res: &mut Response) {
@@ -2460,15 +2736,24 @@ fn set_content_disposition(res: &mut Response, inline: bool, filename: &str) -> 
     Ok(())
 }
 
+fn is_upload_temp(name: &str) -> bool {
+    if cfg!(windows) {
+        name.to_ascii_lowercase().starts_with(UPLOAD_TEMP_PREFIX)
+    } else {
+        name.starts_with(UPLOAD_TEMP_PREFIX)
+    }
+}
+
 fn is_hidden(hidden: &[String], file_name: &str, is_dir: bool) -> bool {
-    hidden.iter().any(|v| {
-        if is_dir {
-            if let Some(x) = v.strip_suffix('/') {
-                return glob(x, file_name);
+    is_upload_temp(file_name)
+        || hidden.iter().any(|v| {
+            if is_dir {
+                if let Some(x) = v.strip_suffix('/') {
+                    return glob(x, file_name);
+                }
             }
-        }
-        glob(v, file_name)
-    })
+            glob(v, file_name)
+        })
 }
 
 fn set_webdav_headers(res: &mut Response) {
@@ -2482,13 +2767,10 @@ fn set_webdav_headers(res: &mut Response) {
         .insert("DAV", HeaderValue::from_static("1, 2, 3"));
 }
 
-async fn get_content_type(path: &Path) -> Result<String> {
+async fn get_content_type(path: &Path, file: &mut fs::File) -> Result<String> {
     let mut buffer: Vec<u8> = vec![];
-    fs::File::open(path)
-        .await?
-        .take(1024)
-        .read_to_end(&mut buffer)
-        .await?;
+    file.take(1024).read_to_end(&mut buffer).await?;
+    file.seek(SeekFrom::Start(0)).await?;
     let mime = mime_guess::from_path(path).first();
     let is_text = content_inspector::inspect(&buffer).is_text();
     let content_type = if is_text {
