@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## [0.47.2] - 2026-11-27
 
 - Negotiate streaming Zstandard file responses with variant-specific validators (RFC 8878 and RFC 9110).
 - Honor HTTP and WebDAV response preferences and vary affected responses (RFC 7240 and RFC 8144).
