@@ -13,6 +13,8 @@ Dufs is a standalone utility file server that supports static serving, uploading
 - Upload files and folders (Drag & Drop)
 - Create/Edit/Search files
 - Resumable/partial uploads/downloads
+- Automatic Zstandard compression for file downloads (HTTP content negotiation)
+- Conditional writes with ETags and HTTP/WebDAV response preferences
 - Access control
 - Support https
 - [WebDAV](#webdav-protocol-support) (Class 1 and Class 3; no Class 2 locking)
@@ -44,7 +46,7 @@ The supported classes describe the implemented protocol behavior, not independen
 | [4918](https://www.rfc-editor.org/rfc/rfc4918) — WebDAV | PROPFIND (`prop`, `allprop`, `include`, `propname`), PROPPATCH, MKCOL, COPY, MOVE, DELETE, and WebDAV `If`. | Class 2 is excluded; arbitrary dead properties are not persisted; infinite-depth PROPFIND and recursive copying of symlink-containing collections are not supported. |
 | [5789](https://www.rfc-editor.org/rfc/rfc5789) — HTTP PATCH | Atomic offset-based patch documents (`application/vnd.dufs.offset-patch`). | A Dufs-specific document format, not JSON Patch or a generic byte-range PATCH standard. |
 | [4331](https://www.rfc-editor.org/rfc/rfc4331) — Quota and size properties | `DAV:quota-available-bytes` and `DAV:quota-used-bytes` on collections; storage exhaustion returns 507. | Reports operating-system volume capacity; no separate per-user or per-directory quota database. |
-| [8144](https://www.rfc-editor.org/rfc/rfc8144) — Prefer | `return=minimal` for property queries and successful property/extended collection changes; `depth-noroot` for Depth 1 PROPFIND; `return=representation` for supported writes and failed conditional writes. | Preferences are applied only where supported and reported in `Preference-Applied`; a representation is returned only where readable and available. |
+| [8144](https://www.rfc-editor.org/rfc/rfc8144) — WebDAV Prefer | `return=minimal` for property queries and successful property/extended collection changes; `depth-noroot` for Depth 1 PROPFIND; `return=representation` for supported writes and failed conditional writes. | Preferences are applied only where supported and reported in `Preference-Applied`; a representation is returned only where readable and available. |
 | [9530](https://www.rfc-editor.org/rfc/rfc9530) — Digest fields | SHA-256 and SHA-512 `Content-Digest` / `Repr-Digest` for requested file GET, HEAD and ranges; supplied PUT/PATCH digests are validated before publishing. | Multipart content digests, dynamically Zstd-coded responses, and generated directory/XML responses are omitted. |
 | [6578](https://www.rfc-editor.org/rfc/rfc6578) — Collection synchronization | `REPORT` with `DAV:sync-collection`, `DAV:sync-token`, `DAV:supported-report-set`, and synchronization-token `If` conditions. | Immediate members only (`sync-level` 1); no infinite-level traversal or partial-token paging; bounded process-local history. |
 | [5323](https://www.rfc-editor.org/rfc/rfc5323) — SEARCH | `DAV:basicsearch`, property selection, scope/depth, comparison and Boolean operators, LIKE, sorting, and limits. Discovered through `DASL: <DAV:basicsearch>`. | Requires `--allow-search`. No optional full-text search, language matching, typed literals, case-folded search, query-schema discovery, or multiple scopes. |
@@ -52,7 +54,7 @@ The supported classes describe the implemented protocol behavior, not independen
 
 ### Operational and interoperability limits
 
-- File downloads negotiate Zstandard automatically, respecting `Accept-Encoding` weights and exclusions. Identity is preferred for byte ranges and requested digests when allowed; otherwise a full encoded response is sent. HEAD ignores Range. Encoded and identity representations use separate strong ETags for caching, and conditional writes recognize either current validator. Zstandard frames use a window of at most 8 MiB.
+- File downloads support [automatic content negotiation](#zstandard-content-encoding), with Zstandard frame windows of at most 8 MiB. HEAD ignores Range. Encoded and identity representations use separate strong ETags for caching, and conditional writes recognize either current validator.
 - Collection PROPFIND supports `Depth: 0` and `Depth: 1`. An infinite depth (including the implicit default when Depth is absent) is rejected with the standard `DAV:propfind-finite-depth` error. Single-file serving mode does not advertise the collection protocol.
 - PROPPATCH reports per-property status transactionally. Protected live properties and arbitrary dead-property writes are rejected; optional properties such as `DAV:creationdate` are not implemented.
 - MKCOL, PUT, COPY, and MOVE require an existing parent collection. COPY and MOVE operate within the server. Recursive operations remain subject to the configured access rules. A failed recursive COPY is rolled back rather than completing a partial copy. Recursive COPY of a collection containing symbolic links is rejected. Links outside the serving root are denied by default; following them is a separate administrator-configured server policy, not a WebDAV requirement.
@@ -235,6 +237,80 @@ Resumable downloads
 
 ```sh
 curl -C- -o file http://127.0.0.1:5000/file
+```
+
+### Zstandard content encoding
+
+File responses automatically negotiate Zstandard (RFC 8878 and RFC 9110).
+No server option or special URL is required. The `--compress` option only
+controls ZIP archive compression, not HTTP content encoding.
+
+| Request headers | File response |
+| --- | --- |
+| No `Accept-Encoding`, or `Accept-Encoding: identity` | Original file |
+| `Accept-Encoding: zstd` | Zstandard stream with `Content-Encoding: zstd` |
+| `Accept-Encoding: zstd;q=0` | Original file |
+| `Accept-Encoding: zstd` and a satisfiable byte `Range` | Uncompressed `206 Partial Content` |
+| `Accept-Encoding: zstd, identity;q=0` and `Range` | Full compressed `200 OK` response |
+| `Accept-Encoding: *;q=0` | `406 Not Acceptable` |
+
+Quality weights and wildcard exclusions are respected. Range requests and
+requests for content or representation digests prefer the original bytes
+when identity is acceptable.
+
+Download and automatically decompress (requires curl with Zstandard support):
+
+```sh
+curl --compressed -H 'Accept-Encoding: zstd' -o file http://127.0.0.1:5000/file
+```
+
+Save the encoded response without decompressing it:
+
+```sh
+curl -H 'Accept-Encoding: zstd' -o file.zst http://127.0.0.1:5000/file
+```
+
+Request original bytes for resuming or verifying a download:
+
+```sh
+curl -H 'Accept-Encoding: identity' -C- -o file http://127.0.0.1:5000/file
+```
+
+An existing `.zst` file is served as `application/zstd`; this media type
+is independent of HTTP content encoding. Generated directory listings, XML
+and ZIP downloads are not dynamically compressed. Non-identity request
+content encodings are rejected with `415 Unsupported Media Type`.
+
+### Conditional requests and response preferences
+
+Use the strong ETag returned by GET or HEAD to protect a file from
+accidental overwrites. Compressed and uncompressed responses have distinct
+ETags, but conditional writes accept either current file validator. A stale
+validator returns `412 Precondition Failed` without changing the file.
+For conditional GETs, reuse the ETag with the same content negotiation
+headers in `If-None-Match` to receive `304 Not Modified` when unchanged.
+
+```sh
+curl -I -H 'Accept-Encoding: zstd' http://127.0.0.1:5000/file
+# Replace the example value with the complete ETag from the response.
+etag='"example-etag"'
+curl -i -T local-file -H "If-Match: $etag" \
+  -H 'Prefer: return=representation' http://127.0.0.1:5000/file
+```
+
+With upload/overwrite permission, a successful update returns the current
+representation when `return=representation` is honored. A failed
+conditional write may also return the current readable representation
+with status 412. Use `Prefer: return=minimal` instead to request an empty
+success response. Inspect `Preference-Applied` to see which preferences
+were honored.
+
+List a collection's immediate children, omitting the collection itself
+and unnecessary missing-property statuses (RFC 8144):
+
+```sh
+curl -i -X PROPFIND -H 'Depth: 1' \
+  -H 'Prefer: return=minimal, depth-noroot' http://127.0.0.1:5000/
 ```
 
 ### Offset PATCH extension
