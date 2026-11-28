@@ -143,3 +143,37 @@ fn extended_mkcol(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     );
     Ok(())
 }
+
+#[rstest]
+fn minimal_write_and_vary(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+    let url = format!("{}minimal.txt", server.url());
+    let created = fetch!(b"PUT", &url).body("first").send()?;
+    assert_eq!(created.status(), 201);
+    assert_eq!(created.headers()["Vary"], "Prefer");
+    let updated = fetch!(b"PUT", &url)
+        .header("Prefer", "unknown=\"a,b\", return=minimal")
+        .body("second")
+        .send()?;
+    assert_eq!(updated.status(), 204);
+    assert_eq!(updated.headers()["Preference-Applied"], "return=minimal");
+    assert_eq!(updated.headers()["Vary"], "Prefer");
+    assert!(updated.bytes()?.is_empty());
+    Ok(())
+}
+
+#[rstest]
+fn prefer_token_values_and_duplicates(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+    let url = format!("{}tokens.txt", server.url());
+    let response = fetch!(b"PUT", &url)
+        .header("Prefer", "RETURN=\"minimal\"; extension=\"a,b;c\"")
+        .header("Prefer", "return=representation")
+        .body("data").send()?;
+    assert_eq!(response.status(), 201);
+    assert_eq!(response.headers()["Preference-Applied"], "return=minimal");
+    let response = fetch!(b"PUT", &url)
+        .header("Prefer", "return=MINIMAL, return=representation")
+        .body("data").send()?;
+    assert_eq!(response.status(), 204);
+    assert!(response.headers().get("Preference-Applied").is_none());
+    Ok(())
+}

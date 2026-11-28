@@ -4,6 +4,7 @@ mod dav_common;
 mod dav_search;
 mod dav_sync;
 mod http_digest;
+mod http_encoding;
 use dav_common::DavPrefer;
 
 use crate::auth::{www_authenticate, AccessControl, AccessPaths, AccessPerm, EntryAccess};
@@ -23,7 +24,7 @@ use futures_util::TryStreamExt;
 use headers::{
     AcceptRanges, AccessControlAllowOrigin, CacheControl, ContentLength, ContentType, ETag,
     HeaderMap, HeaderMapExt, IfMatch, IfModifiedSince, IfNoneMatch, IfRange, IfUnmodifiedSince,
-    LastModified, Range,
+    LastModified,
 };
 use http_body_util::{combinators::BoxBody, BodyExt, Limited, StreamBody};
 use hyper::body::Frame;
@@ -124,6 +125,8 @@ impl Server {
         let uri = req.uri().clone();
         let assets_prefix = &self.assets_prefix;
         let enable_cors = self.args.enable_cors;
+        let vary_prefer = is_write_method(req.method())
+            || matches!(req.method().as_str(), "PROPFIND" | "PROPPATCH" | "REPORT" | "SEARCH");
         let mut http_log_data = self.args.http_logger.data(&req);
         if let Some(addr) = addr {
             http_log_data.insert("remote_addr".to_string(), addr.ip().to_string());
@@ -170,6 +173,9 @@ impl Server {
             }
         };
 
+        if vary_prefer {
+            res.headers_mut().append("Vary", HeaderValue::from_static("Prefer"));
+        }
         if enable_cors {
             add_cors(&mut res);
         }
@@ -285,6 +291,14 @@ impl Server {
             (x, Some(y)) => (x, y),
         };
 
+        if headers.get_all("Content-Encoding").iter().any(|v| {
+            !v.to_str().is_ok_and(|v| v.split(',').all(|coding| coding.trim().eq_ignore_ascii_case("identity")))
+        }) {
+            *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+            res.headers_mut().insert("Accept-Encoding", HeaderValue::from_static("identity"));
+            return Ok(res);
+        }
+
         let dav_if = match dav_if {
             Ok(parsed) => parsed,
             Err(_) => {
@@ -336,8 +350,15 @@ impl Server {
                 .iter()
                 .any(|v| v.as_str() == req_path)
             {
-                self.handle_send_file(&self.args.serve_path, headers, head_only, &mut res)
-                    .await?;
+                if matches!(method, Method::GET | Method::HEAD) {
+                    self.handle_send_file(&self.args.serve_path, headers, head_only, &mut res)
+                        .await?;
+                } else {
+                    res.headers_mut().insert("Allow", HeaderValue::from_static("GET, HEAD, OPTIONS, CHECKAUTH, LOGOUT"));
+                    if method != Method::OPTIONS {
+                        DufsErrorCode::MethodNotAllowed.respond(&mut res);
+                    }
+                }
             } else {
                 self.handle_not_found(&query_params, head_only, &mut res)
                     .await?;
@@ -418,6 +439,12 @@ impl Server {
         };
 
         let prefer = DavPrefer::parse(headers);
+        let mut response_headers = HeaderMap::new();
+        if prefer.representation {
+            for value in headers.get_all("Accept-Encoding") {
+                response_headers.append("Accept-Encoding", value.clone());
+            }
+        }
         if !dav_if.is_empty() {
             let mut matched = false;
             for group in dav_if {
@@ -496,10 +523,10 @@ impl Server {
                 DufsErrorCode::PreconditionFailed.respond(&mut res);
                 if prefer.representation
                     && !via_token
-                    && matches!(method.as_str(), "PUT" | "PATCH" | "COPY" | "MOVE")
+                    && matches!(method.as_str(), "PUT" | "PATCH" | "COPY" | "MOVE" | "DELETE")
                 {
                     let _ = self
-                        .preferred_representation(path, user.clone(), prefer, &mut res)
+                        .preferred_representation(path, user.clone(), prefer, &response_headers, &mut res)
                         .await;
                 }
                 return Ok(res);
@@ -1070,9 +1097,16 @@ impl Server {
             self.sync_observe_tracked(path, response_destination.as_deref())
                 .await;
         }
+        if prefer.minimal
+            && matches!(method.as_str(), "PUT" | "PATCH" | "COPY" | "MOVE" | "DELETE")
+            && matches!(res.status(), StatusCode::CREATED | StatusCode::NO_CONTENT)
+        {
+            prefer.applied(&mut res, true, false, false);
+        }
         if prefer.representation
             && !via_token
-            && matches!(method.as_str(), "PUT" | "PATCH" | "COPY" | "MOVE")
+            && (matches!(method.as_str(), "PUT" | "PATCH" | "COPY" | "MOVE")
+                || (method == Method::DELETE && res.status() == StatusCode::PRECONDITION_FAILED))
             && matches!(
                 res.status(),
                 StatusCode::OK
@@ -1088,7 +1122,7 @@ impl Server {
             };
             // A response preference must not turn an already committed write into an error.
             let _ = self
-                .preferred_representation(target, response_user, prefer, &mut res)
+                .preferred_representation(target, response_user, prefer, &response_headers, &mut res)
                 .await;
         }
         Ok(res)
@@ -1099,6 +1133,7 @@ impl Server {
         path: &Path,
         user: Option<String>,
         prefer: DavPrefer,
+        headers: &HeaderMap,
         res: &mut Response,
     ) -> Result<()> {
         let Ok(relative) = path.strip_prefix(&self.args.serve_path) else {
@@ -1125,7 +1160,7 @@ impl Server {
         };
         let mut representation = Response::default();
         if meta.is_file() {
-            self.handle_send_file(path, &HeaderMap::new(), false, &mut representation)
+            self.handle_send_file(path, headers, false, &mut representation)
                 .await?;
         } else if meta.is_dir() {
             representation = self
@@ -1771,8 +1806,27 @@ impl Server {
         let mut file = fs::File::open(path).await?;
         let meta = file.metadata().await?;
         let size = meta.len();
-        let mut use_range = true;
-        let cache_headers = extract_cache_headers(&meta);
+        res.headers_mut().append("Vary", HeaderValue::from_static("Accept-Encoding"));
+        res.headers_mut().append("Vary", HeaderValue::from_static("Range, Want-Content-Digest, Want-Repr-Digest"));
+        let range_requested = !head_only && headers.get(RANGE).is_some_and(|value| {
+            value.to_str().ok().and_then(|v| v.split_once('='))
+                .is_some_and(|(unit, _)| unit.eq_ignore_ascii_case("bytes"))
+        });
+        let coding = http_encoding::select(headers, range_requested);
+        let zstd = match coding {
+            Some(value) => value,
+            None => {
+                *res.status_mut() = StatusCode::NOT_ACCEPTABLE;
+                return Ok(());
+            }
+        };
+        let mut use_range = range_requested && !zstd;
+        let mut cache_headers = extract_cache_headers(&meta);
+        if zstd {
+            cache_headers = cache_headers.and_then(|(etag, modified)| {
+                http_encoding::zstd_etag(&etag).map(|tag| (tag, modified))
+            });
+        }
         if !check_preconditions(headers, cache_headers.as_ref(), true, true, res) {
             return Ok(());
         }
@@ -1782,15 +1836,17 @@ impl Server {
             res.headers_mut().typed_insert(last_modified);
             res.headers_mut().typed_insert(etag.clone());
 
-            if headers.typed_get::<Range>().is_some() {
-                use_range = headers
-                    .typed_get::<IfRange>()
-                    .map(|if_range| !if_range.is_modified(Some(&etag), Some(&last_modified)))
-                    // Always be fresh if there is no validators
-                    .unwrap_or(true);
-            } else {
-                use_range = false;
+            if use_range && headers.contains_key("If-Range") {
+                // If-Range dates use exact equality, not the earlier-than
+                // comparison used by If-Unmodified-Since.
+                use_range = if let Ok(date) = headers::Header::decode(&mut headers.get_all("If-Range").iter()) {
+                    last_modified == date
+                } else {
+                    headers.typed_get::<IfRange>().is_some_and(|v| !v.is_modified(Some(&etag), None))
+                };
             }
+        } else if headers.contains_key("If-Range") {
+            use_range = false;
         }
 
         // RFC 9110 §14.2: a server MAY ignore Range when the selected
@@ -1802,7 +1858,7 @@ impl Server {
                 range
                     .to_str()
                     .ok()
-                    .and_then(|range| parse_range(range, size))
+                    .and_then(|range| parse_range(range, size, true))
             })
         } else {
             None
@@ -1815,6 +1871,20 @@ impl Server {
         let filename = try_get_file_name(path)?;
         set_content_disposition(res, true, filename)?;
 
+        if zstd {
+            res.headers_mut().insert("Content-Encoding", HeaderValue::from_static("zstd"));
+            let encoder = async_compression::tokio::bufread::ZstdEncoder::with_quality_and_params(
+                io::BufReader::new(file),
+                async_compression::Level::Default,
+                &[async_compression::zstd::CParameter::window_log(23)],
+            );
+            *res.body_mut() = StreamBody::new(
+                ReaderStream::with_capacity(encoder, BUF_SIZE)
+                    .map_ok(Frame::data)
+                    .map_err(anyhow::Error::new),
+            ).boxed();
+            return Ok(());
+        }
         res.headers_mut().typed_insert(AcceptRanges::bytes());
 
         if let Some(ranges) = ranges {
@@ -3615,7 +3685,9 @@ impl DavIfGroup {
             list.iter().all(|(negated, tag)| {
                 let matches = match tag {
                     DavCondition::Tag(tag) => current.is_some_and(|current| {
-                        !IfNoneMatch::from(tag.clone()).precondition_passes(current)
+                        let condition = IfNoneMatch::from(tag.clone());
+                        !condition.precondition_passes(current)
+                            || http_encoding::zstd_etag(current).is_some_and(|encoded| !condition.precondition_passes(&encoded))
                     }),
                     DavCondition::Token(token) => sync == Some(token.as_str()),
                 };
@@ -4035,11 +4107,19 @@ fn evaluate_preconditions(
     exists: bool,
     allow_not_modified: bool,
 ) -> Precondition {
+    // State-changing requests accept either strong validator for the same
+    // file revision, so negotiated GETs remain usable for conditional writes.
+    let encoded = if allow_not_modified {
+        None
+    } else {
+        cache_headers.and_then(|(etag, _)| http_encoding::zstd_etag(etag))
+    };
     let if_match = headers.typed_get::<IfMatch>();
     if let Some(if_match) = &if_match {
         if !exists
             || (!if_match.is_any()
-                && !cache_headers.is_some_and(|(etag, _)| if_match.precondition_passes(etag)))
+                && !cache_headers.is_some_and(|(etag, _)| if_match.precondition_passes(etag))
+                && !encoded.as_ref().is_some_and(|etag| if_match.precondition_passes(etag)))
         {
             return Precondition::Failed;
         }
@@ -4060,7 +4140,8 @@ fn evaluate_preconditions(
     if let Some(if_none_match) = &if_none_match {
         if exists
             && (if_none_match == &IfNoneMatch::any()
-                || cache_headers.is_some_and(|(etag, _)| !if_none_match.precondition_passes(etag)))
+                || cache_headers.is_some_and(|(etag, _)| !if_none_match.precondition_passes(etag))
+                || encoded.as_ref().is_some_and(|etag| !if_none_match.precondition_passes(etag)))
         {
             return if allow_not_modified {
                 Precondition::NotModified
@@ -4226,6 +4307,9 @@ async fn get_content_type(path: &Path, file: &mut fs::File) -> Result<String> {
     let mut buffer: Vec<u8> = vec![];
     file.take(1024).read_to_end(&mut buffer).await?;
     file.seek(SeekFrom::Start(0)).await?;
+    if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zst")) {
+        return Ok("application/zstd".into());
+    }
     let mime = mime_guess::from_path(path).first();
     let is_text = content_inspector::inspect(&buffer).is_text();
     let content_type = if is_text {
@@ -4257,7 +4341,7 @@ fn parse_upload_offset(headers: &HeaderMap<HeaderValue>, size: u64) -> Result<Op
         return Ok(Some(size));
     }
     // use the first range
-    let ranges = parse_range(value, size).ok_or_else(err)?;
+    let ranges = parse_range(value, size, false).ok_or_else(err)?;
     let (start, _) = ranges.first().ok_or_else(err)?;
     Ok(Some(*start))
 }

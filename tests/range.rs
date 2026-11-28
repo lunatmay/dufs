@@ -133,11 +133,8 @@ fn head_file_range_last_pos_beyond_eof(server: TestServer) -> Result<(), Error> 
     let resp = fetch!(b"HEAD", format!("{}index.html", server.url()))
         .header("range", HeaderValue::from_static("bytes=0-19"))
         .send()?;
-    assert_eq!(resp.status(), 206);
-    assert_eq!(
-        resp.headers().get("content-range").unwrap(),
-        "bytes 0-17/18"
-    );
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("content-range").is_none());
     assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
     assert_eq!(resp.headers().get("content-length").unwrap(), "18");
     Ok(())
@@ -179,13 +176,13 @@ fn get_file_multipart_range_last_pos_beyond_eof(server: TestServer) -> Result<()
 
 #[rstest]
 fn get_file_multipart_range_first_pos_beyond_eof(server: TestServer) -> Result<(), Error> {
-    // Mixed satisfiable + unsatisfiable (first-pos >= size) is still 416
     let resp = fetch!(b"GET", format!("{}index.html", server.url()))
         .header("range", HeaderValue::from_static("bytes=0-19, 20-"))
         .send()?;
-    assert_eq!(resp.status(), 416);
-    assert_eq!(resp.headers().get("content-range").unwrap(), "bytes */18");
+    assert_eq!(resp.status(), 206);
+    assert_eq!(resp.headers().get("content-range").unwrap(), "bytes 0-17/18");
     assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
+    assert_eq!(resp.text()?, "This is index.html");
     Ok(())
 }
 
@@ -271,31 +268,23 @@ fn get_file_multipart_range_too_many(server: TestServer) -> Result<(), Error> {
 
 #[rstest]
 fn head_file_multipart_range(server: TestServer) -> Result<(), Error> {
-    // HEAD must report the same headers as GET without transferring a body
-    let get = fetch!(b"GET", format!("{}index.html", server.url()))
-        .header("range", HeaderValue::from_static("bytes=0-11, 6-17"))
-        .send()?;
-    assert_eq!(get.status(), 206);
-    let content_type = get
-        .headers()
-        .get("content-type")
-        .unwrap()
-        .to_str()?
-        .to_string();
-    assert!(content_type.starts_with("multipart/byteranges; boundary="));
-    let body_len = get.text()?.len();
-
     let resp = fetch!(b"HEAD", format!("{}index.html", server.url()))
         .header("range", HeaderValue::from_static("bytes=0-11, 6-17"))
         .send()?;
-    assert_eq!(resp.status(), 206);
-    let head_content_type = resp.headers().get("content-type").unwrap().to_str()?;
-    assert!(head_content_type.starts_with("multipart/byteranges; boundary="));
-    assert_eq!(
-        resp.headers().get("content-length").unwrap(),
-        &body_len.to_string()
-    );
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("content-range").is_none());
+    assert_eq!(resp.headers().get("content-length").unwrap(), "18");
     assert_eq!(resp.text()?, "");
+    Ok(())
+}
+
+#[rstest]
+fn unknown_range_unit_ignored(server: TestServer) -> Result<(), Error> {
+    let resp = fetch!(b"GET", format!("{}index.html", server.url()))
+        .header("range", "items=0-1")
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "This is index.html");
     Ok(())
 }
 
@@ -337,10 +326,10 @@ fn get_file_multipart_range_invalid(server: TestServer) -> Result<(), Error> {
     let resp = fetch!(b"GET", format!("{}index.html", server.url()))
         .header("range", HeaderValue::from_static("bytes=0-6, 20-30"))
         .send()?;
-    assert_eq!(resp.status(), 416);
-    assert_eq!(resp.headers().get("content-range").unwrap(), "bytes */18");
+    assert_eq!(resp.status(), 206);
+    assert_eq!(resp.headers().get("content-range").unwrap(), "bytes 0-6/18");
     assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
-    assert_eq!(resp.headers().get("content-length").unwrap(), "0");
+    assert_eq!(resp.text()?, "This is");
     Ok(())
 }
 
@@ -363,5 +352,18 @@ fn get_file_multipart_range_reversed(server: TestServer) -> Result<(), Error> {
     assert_eq!(resp.status(), 416);
     assert_eq!(resp.headers().get("content-range").unwrap(), "bytes */18");
     assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
+    Ok(())
+}
+
+
+#[rstest]
+fn if_range_date_exact_match(server: TestServer) -> Result<(), Error> {
+    let url = format!("{}index.html", server.url());
+    let head = fetch!(b"HEAD", &url).send()?;
+    let date = head.headers()["Last-Modified"].clone();
+    let matched = fetch!(b"GET", &url).header("Range", "bytes=0-3").header("If-Range", date).send()?;
+    assert_eq!(matched.status(), 206);
+    let future = fetch!(b"GET", &url).header("Range", "bytes=0-3").header("If-Range", "Fri, 01 Jan 2100 00:00:00 GMT").send()?;
+    assert_eq!(future.status(), 200);
     Ok(())
 }

@@ -34,7 +34,7 @@ fn hidden_get_dir2(#[case] server: TestServer, #[case] exist: bool) -> Result<()
 #[case(server(&[] as &[&str]), true)]
 #[case(server(&["--hidden", ".git,index.html"]), false)]
 fn hidden_propfind_dir(#[case] server: TestServer, #[case] exist: bool) -> Result<(), Error> {
-    let resp = fetch!(b"PROPFIND", server.url()).send()?;
+    let resp = fetch!(b"PROPFIND", server.url()).header("Depth", "1").send()?;
     assert_eq!(resp.status(), 207);
     let body = resp.text()?;
     assert!(body.contains("<D:href>/dir1/</D:href>"));

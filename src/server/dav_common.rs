@@ -85,6 +85,7 @@ impl DavPrefer {
     pub(super) fn parse(headers: &HeaderMap<HeaderValue>) -> Self {
         let mut preference = Self::default();
         let mut returns = false;
+        let mut noroot_seen = false;
         // Preference tokens can be split across fields, and extension values may be quoted.
         for value in headers
             .get_all("Prefer")
@@ -112,21 +113,18 @@ impl DavPrefer {
                 if char != ',' || quoted {
                     continue;
                 }
-                let item = value[start..index].split(';').next().unwrap_or("").trim();
+                let item = value[start..index].trim();
                 start = index + 1;
-                let (key, value) = item.split_once('=').unwrap_or((item, ""));
-                if key.trim().eq_ignore_ascii_case("return") && !returns {
-                    preference.minimal = value
-                        .trim()
-                        .trim_matches('"')
-                        .eq_ignore_ascii_case("minimal");
-                    preference.representation = value
-                        .trim()
-                        .trim_matches('"')
-                        .eq_ignore_ascii_case("representation");
+                let Some((key, value)) = parse_preference(item) else {
+                    continue;
+                };
+                if key.eq_ignore_ascii_case("return") && !returns {
+                    preference.minimal = value == "minimal";
+                    preference.representation = value == "representation";
                     returns = true;
-                } else if key.trim().eq_ignore_ascii_case("depth-noroot") && value.is_empty() {
-                    preference.noroot = true;
+                } else if key.eq_ignore_ascii_case("depth-noroot") && !noroot_seen {
+                    preference.noroot = value.is_empty();
+                    noroot_seen = true;
                 }
             }
         }
@@ -156,6 +154,33 @@ impl DavPrefer {
                 HeaderValue::from_str(&values.join(", ")).unwrap(),
             );
         }
+    }
+}
+
+// Compare decoded quoted-string values case-sensitively (RFC 7240 §2).
+fn parse_preference(item: &str) -> Option<(&str, String)> {
+    let end = item.find(['=', ';']).unwrap_or(item.len());
+    let key = item[..end].trim();
+    let Some(value) = item[end..].strip_prefix('=') else {
+        return Some((key, String::new()));
+    };
+    let value = value.trim_start();
+    if let Some(quoted) = value.strip_prefix('"') {
+        let mut decoded = String::new();
+        let mut chars = quoted.char_indices();
+        while let Some((index, ch)) = chars.next() {
+            match ch {
+                '\\' => decoded.push(chars.next()?.1),
+                '"' => {
+                    let tail = quoted[index + 1..].trim_start();
+                    return (tail.is_empty() || tail.starts_with(';')).then_some((key, decoded));
+                }
+                _ => decoded.push(ch),
+            }
+        }
+        None
+    } else {
+        Some((key, value.split(';').next()?.trim().to_owned()))
     }
 }
 

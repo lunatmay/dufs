@@ -101,9 +101,9 @@ pub fn load_private_key<T: AsRef<Path>>(file_name: T) -> Result<PrivateKeyDer<'s
     })
 }
 
-pub fn parse_range(range: &str, size: u64) -> Option<Vec<(u64, u64)>> {
+pub fn parse_range(range: &str, size: u64, skip_unsatisfiable: bool) -> Option<Vec<(u64, u64)>> {
     let (unit, ranges) = range.split_once('=')?;
-    if unit != "bytes" {
+    if !unit.eq_ignore_ascii_case("bytes") {
         return None;
     }
 
@@ -114,6 +114,9 @@ pub fn parse_range(range: &str, size: u64) -> Option<Vec<(u64, u64)>> {
             let offset = end.parse::<u64>().ok()?;
             // A zero-length suffix range is unsatisfiable.
             if offset == 0 {
+                if skip_unsatisfiable {
+                    continue;
+                }
                 return None;
             }
             // A zero-length representation has no representable byte range
@@ -128,19 +131,18 @@ pub fn parse_range(range: &str, size: u64) -> Option<Vec<(u64, u64)>> {
             (size.saturating_sub(offset), size - 1)
         } else {
             let start = start.parse::<u64>().ok()?;
-            if start >= size {
+            let end = if end.is_empty() { None } else { Some(end.parse::<u64>().ok()?) };
+            if end.is_some_and(|end| start > end) {
                 return None;
             }
-            if end.is_empty() {
-                (start, size - 1)
-            } else {
-                let end = end.parse::<u64>().ok()?;
-                if start > end {
-                    return None;
+            if start >= size {
+                if skip_unsatisfiable {
+                    continue;
                 }
-                // RFC 9110 §14.1.2: clamp last-pos to size - 1
-                (start, end.min(size - 1))
+                return None;
             }
+            // RFC 9110 §14.1.2: clamp last-pos to size - 1.
+            (start, end.unwrap_or(size - 1).min(size - 1))
         };
         // Ignore duplicate ranges so they can't be used to amplify work.
         if !result.contains(&item) {
@@ -151,7 +153,7 @@ pub fn parse_range(range: &str, size: u64) -> Option<Vec<(u64, u64)>> {
         }
     }
 
-    Some(result)
+    (!result.is_empty()).then_some(result)
 }
 
 pub fn is_ipv6_available() -> bool {
@@ -213,6 +215,7 @@ mod tests {
 
     #[test]
     fn test_parse_range() {
+        let parse_range = |range: &str, size| super::parse_range(range, size, false);
         assert_eq!(parse_range("bytes=0-499", 500), Some(vec![(0, 499)]));
         assert_eq!(parse_range("bytes=0-", 500), Some(vec![(0, 499)]));
         assert_eq!(parse_range("bytes=299-", 500), Some(vec![(299, 499)]));

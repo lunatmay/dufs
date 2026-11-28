@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+- Negotiate streaming Zstandard file responses with variant-specific validators (RFC 8878 and RFC 9110).
+- Honor HTTP and WebDAV response preferences and vary affected responses (RFC 7240 and RFC 8144).
+- Ignore Range on HEAD and unknown range units, handle mixed satisfiable byte ranges, and require exact If-Range dates (RFC 9110).
+
 ## [0.47.1] - 2026-11-26
 
 ### JoyPlay fork
